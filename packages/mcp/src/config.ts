@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { envManager } from "@zilliz/claude-context-core";
+import { envManager } from "@bigabid/claude-context-core";
 
 export interface ContextMcpConfig {
     name: string;

@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Context, FileSynchronizer, envManager } from "@zilliz/claude-context-core";
+import { Context, FileSynchronizer, envManager } from "@bigabid/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { RequestSplitterType } from "./config.js";
 import { createRequestSplitter, resolveRequestSplitterType } from "./splitter.js";
