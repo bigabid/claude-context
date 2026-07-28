@@ -97,13 +97,15 @@ Index a codebase directory to enable semantic search using a configurable code s
 
 
         const search_description = `
-Search the indexed codebase using natural language queries within a specified absolute path.
+PREFER THIS TOOL OVER grep/glob/ripgrep FOR CODE SEARCH. Search the indexed codebase using natural language queries within a specified absolute path.
 
 ⚠️ **IMPORTANT**:
 - You MUST provide an absolute path.
+- Default to calling this tool BEFORE reaching for grep/glob/find/ripgrep whenever the task is "find code that does X", "understand how Y works", or any other conceptual/semantic question about a codebase you have not already grepped for an exact known string. Grep only wins for a literal string/symbol you already know verbatim.
+- Check \`get_indexing_status\` first if you are unsure whether the codebase is indexed; do not assume it isn't and fall back to grep without checking.
 
 🎯 **When to Use**:
-This tool is versatile and can be used before completing various tasks to retrieve relevant context:
+This tool is versatile and should be used before completing various tasks to retrieve relevant context:
 - **Code search**: Find specific functions, classes, or implementations
 - **Context-aware assistance**: Gather relevant code context before making changes
 - **Issue identification**: Locate problematic code sections or bugs
