@@ -1,0 +1,22 @@
+claude-context-sync-worker is deployed as a CronJob, schedule: {{ .Values.schedule }}
+
+This worker is meant to be the SOLE indexer for the repos it covers - see
+packages/sync-worker/README.md for why running it alongside laptop-side
+`index_codebase` on the same repos is unsafe (one can delete the other's vectors).
+
+1. Trigger an immediate run without waiting for the schedule:
+   kubectl -n {{ .Release.Namespace }} create job --from=cronjob/{{ include "claude-context-sync-worker.fullname" . }} {{ include "claude-context-sync-worker.fullname" . }}-manual-$(date +%s)
+
+2. Watch it:
+   kubectl -n {{ .Release.Namespace }} get jobs -l {{ include "claude-context-sync-worker.selectorLabels" . }}
+   kubectl -n {{ .Release.Namespace }} logs -l {{ include "claude-context-sync-worker.selectorLabels" . }} --tail=200 -f
+
+3. Verify the GitHub App is set up correctly (Contents:read, Metadata:read,
+   installed on the target org) if a run fails discovering repos - check:
+   kubectl -n {{ .Release.Namespace }} logs -l {{ include "claude-context-sync-worker.selectorLabels" . }} --tail=50
+
+{{- if not .Values.persistence.enabled }}
+
+Note: persistence.enabled is false - every run will fully re-clone and
+re-embed every repo instead of doing an incremental diff.
+{{- end }}

@@ -1,0 +1,112 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "claude-context-sync-worker.fullname" . }}
+  labels:
+    {{- include "claude-context-sync-worker.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+      backoffLimit: {{ .Values.backoffLimit }}
+      template:
+        metadata:
+          {{- with .Values.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          labels:
+            {{- include "claude-context-sync-worker.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "claude-context-sync-worker.serviceAccountName" . }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: {{ .Chart.Name }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- $secretName := include "claude-context-sync-worker.secretName" . }}
+              {{- if $secretName }}
+              envFrom:
+                - secretRef:
+                    name: {{ $secretName }}
+              {{- end }}
+              env:
+                - name: GITHUB_APP_ID
+                  value: {{ required "github.appId is required" .Values.github.appId | quote }}
+                - name: GITHUB_APP_INSTALLATION_ID
+                  value: {{ required "github.installationId is required" .Values.github.installationId | quote }}
+                - name: GITHUB_APP_PRIVATE_KEY_PATH
+                  value: /etc/claude-context/github-app-private-key.pem
+                {{- if .Values.github.excludeRepos }}
+                - name: SYNC_EXCLUDE_REPOS
+                  value: {{ join "," .Values.github.excludeRepos | quote }}
+                {{- end }}
+                - name: SYNC_INCLUDE_ARCHIVED
+                  value: {{ .Values.github.includeArchived | quote }}
+                - name: SYNC_INCLUDE_FORKS
+                  value: {{ .Values.github.includeForks | quote }}
+                # Repo checkouts AND the merkle sync-state that makes reindexByChange
+                # incremental (~/.context/merkle/*.json) both live on the same PVC,
+                # so both survive between CronJob runs - not just the git checkouts.
+                - name: SYNC_REPOS_DIR
+                  value: /data/repos
+                - name: HOME
+                  value: /data/home
+                {{- range $key, $value := .Values.env }}
+                - name: {{ $key }}
+                  value: {{ $value | quote }}
+                {{- end }}
+                {{- range .Values.extraEnv }}
+                - name: {{ .name }}
+                  value: {{ .value | quote }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: repos
+                  mountPath: /data
+                {{- if $secretName }}
+                - name: github-app-key
+                  mountPath: /etc/claude-context
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: repos
+              {{- if .Values.persistence.enabled }}
+              persistentVolumeClaim:
+                claimName: {{ include "claude-context-sync-worker.pvcName" . }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+            {{- if $secretName }}
+            - name: github-app-key
+              secret:
+                secretName: {{ $secretName }}
+                items:
+                  - key: {{ .Values.githubAppPrivateKeySecretKey }}
+                    path: github-app-private-key.pem
+            {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}

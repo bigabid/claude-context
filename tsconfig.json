@@ -41,6 +41,9 @@
         },
         {
             "path": "./packages/mcp"
+        },
+        {
+            "path": "./packages/sync-worker"
         }
     ],
     "files": []
