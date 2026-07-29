@@ -315,7 +315,7 @@ claude mcp add --transport http claude-context-org https://<your-host>/mcp \
   --header "Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>"
 ```
 
-Note: a shared HTTP server has no access to any user's local git checkouts, so `index_codebase` still needs to run from a machine (or CI job) that has the target repo checked out — the hosted server is for `search_code`/`search_repo`/`search_org`/`list_indexed_repos` against already-indexed collections.
+Note: a shared HTTP server has no access to any user's local git checkouts, so `index_codebase` still needs to run from a machine (or CI job) that has the target repo checked out — the hosted server is for `search_code`/`search_repo`/`search_org`/`list_indexed_repos` against already-indexed collections. To keep those collections fresh automatically instead of relying on someone's laptop, see [`@bigabid/claude-context-sync-worker`](../sync-worker/README.md) — a scheduled job that auto-discovers a GitHub org's repos and indexes them.
 
 ### Docker / Kubernetes (EKS)
 

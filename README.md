@@ -597,6 +597,13 @@ results.forEach(result => {
 });
 ```
 
+### Hosting a Shared Server + Auto-Sync Worker
+
+Two components for running Claude Context centrally for a team instead of one local process per user:
+
+- **[`@bigabid/claude-context-mcp` over HTTP](packages/mcp/README.md#hosting-as-a-shared-server-http-transport)** — the MCP server itself, run as a shared, stateless HTTP service (`Dockerfile`, [Helm chart](deploy/helm/claude-context-mcp)) instead of stdio. Handles search; has no access to anyone's local git checkouts, so it can't index new repos on its own.
+- **[`@bigabid/claude-context-sync-worker`](packages/sync-worker/README.md)** — a standalone Kubernetes CronJob that auto-discovers a GitHub org's repos via a GitHub App and keeps them indexed, so the shared server always has fresh content to search (`Dockerfile.sync-worker`, [Helm chart](deploy/helm/claude-context-sync-worker)). Meant to be the sole indexer for whichever repos it covers — see its README for why running it alongside laptop-side indexing of the same repos is unsafe.
+
 ### VSCode Extension
 
 Integrates Claude Context directly into your IDE. Provides an intuitive interface for semantic code search and navigation.
