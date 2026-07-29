@@ -11,7 +11,7 @@ Claude Context is an MCP plugin that adds semantic code search to AI coding agen
 pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 <24 and pnpm >=10.
 
 - `packages/core` (`@zilliz/claude-context-core`) — the indexing engine. All real logic lives here; the other packages are thin frontends over it.
-- `packages/mcp` (`@zilliz/claude-context-mcp`) — stdio MCP server, the primary product. ESM (`"type": "module"`).
+- `packages/mcp` (`@zilliz/claude-context-mcp`) — MCP server, the primary product. ESM (`"type": "module"`). Defaults to stdio transport (one local process per user); `MCP_TRANSPORT=http` runs it as a shared Streamable HTTP server instead (stateless per request, so safe behind a plain load balancer) — see `Dockerfile` (repo root, multi-arch) and `deploy/helm/claude-context-mcp` (Helm chart) for hosting that mode, e.g. in EKS.
 - `packages/vscode-extension` (`semanticcodesearch`) — VSCode extension. Bundled with webpack; stubs out Node-only deps (Milvus gRPC, native AST) in `src/stubs/`.
 - `packages/chrome-extension` — browser build; overrides `@zilliz/milvus2-sdk-node` to `false` (no gRPC in browser).
 - `examples/basic-usage` — runnable library example.
@@ -80,8 +80,8 @@ Layered: built-in `DEFAULT_IGNORE_PATTERNS` + config + env (`CUSTOM_IGNORE_PATTE
 
 ### MCP server (`packages/mcp/src/`)
 
-- `index.ts` — entry point. **Critically, it redirects `console.log`/`console.warn` to stderr at the very top**, because stdout is reserved for the MCP JSON protocol. Never write non-protocol output to stdout in this package.
-- `handlers.ts` (`ToolHandlers`) — implements the tools: `index_codebase`, `search_code`, `clear_index`, `get_indexing_status`.
+- `index.ts` — entry point. **Critically, it redirects `console.log`/`console.warn` to stderr at the very top**, because stdout is reserved for the MCP JSON protocol. Never write non-protocol output to stdout in this package. Also registers global `unhandledRejection`/`uncaughtException` handlers so an unreachable Milvus/embedding endpoint (a rejected promise deep in background sync) logs loudly instead of silently killing the process. `setupTools(server)` takes a `Server` instance so it can be called once (stdio: one long-lived `Server`) or per-request (`MCP_TRANSPORT=http`: a fresh `Server` + `StreamableHTTPServerTransport` pair per request, all sharing the same `Context`/Milvus connection built once at startup).
+- `handlers.ts` (`ToolHandlers`) — implements the tools: `index_codebase`, `search_code`, `clear_index`, `get_indexing_status`, `list_indexed_repos`, `search_repo` (search one repo by git identity, no local checkout needed), `search_org` (fan out across every indexed repo at once).
 - `snapshot.ts` (`SnapshotManager`) — tracks per-codebase indexing state across server restarts.
 - `sync.ts` (`SyncManager`) — drives incremental re-indexing.
 - `config.ts`, `embedding.ts` — build `Context` (embedding provider + Milvus) from environment variables.

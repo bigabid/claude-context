@@ -293,6 +293,42 @@ CLAUDE_CONTEXT_SYNC_INTERVAL_MS=60000
 
 For multi-instance local stdio setups, set `CLAUDE_CONTEXT_BACKGROUND_SYNC=false` and keep the trigger watcher enabled. That avoids idle polling while still allowing external tools to request immediate re-indexing by touching `~/.context/.sync-trigger`.
 
+## Hosting as a Shared Server (HTTP Transport)
+
+By default the server runs over stdio: one local process per user, spawned by their MCP client. To run one shared server instead (e.g. so a team can search each other's indexed repos without everyone running their own process), switch to the Streamable HTTP transport:
+
+```bash
+MCP_TRANSPORT=http                    # default: stdio
+MCP_HTTP_PORT=3000                    # default: 3000
+MCP_HTTP_PATH=/mcp                    # default: /mcp
+MCP_HTTP_AUTH_TOKEN=<a-random-secret>  # strongly recommended - see warning below
+```
+
+The server is stateless per request (`sessionIdGenerator: undefined`), so any replica can serve any request — no session affinity or shared session store needed behind a load balancer. A `/healthz` endpoint is included for liveness/readiness probes.
+
+⚠️ **`MCP_HTTP_AUTH_TOKEN` is not set by default.** Without it, this server accepts requests from anyone who can reach the port and uses ITS Milvus and embedding-provider credentials to serve them — set it before exposing this beyond localhost. Clients must send it as `Authorization: Bearer <token>`.
+
+Point a client at it instead of spawning a local process, e.g.:
+
+```bash
+claude mcp add --transport http claude-context-org https://<your-host>/mcp \
+  --header "Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>"
+```
+
+Note: a shared HTTP server has no access to any user's local git checkouts, so `index_codebase` still needs to run from a machine (or CI job) that has the target repo checked out — the hosted server is for `search_code`/`search_repo`/`search_org`/`list_indexed_repos` against already-indexed collections.
+
+### Docker / Kubernetes (EKS)
+
+A multi-arch (linux/amd64 + linux/arm64) `Dockerfile` is at the repo root, and a Helm chart is at [`deploy/helm/claude-context-mcp`](../../deploy/helm/claude-context-mcp) (Deployment, Service, optional Ingress/HPA/PodDisruptionBudget, and three ways to source secrets — `externalSecret` for [External Secrets Operator](https://external-secrets.io), `existingSecret`, or `secret.create` for dev/test only). See that chart's `values.yaml` for the full set of options.
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t <your-registry>/claude-context-mcp:<tag> --push .
+
+helm upgrade --install claude-context-mcp deploy/helm/claude-context-mcp \
+  --set image.repository=<your-registry>/claude-context-mcp \
+  --set image.tag=<tag>
+```
+
 ## Usage with MCP Clients
 
 <details>
@@ -719,11 +755,13 @@ For LangChain/LangGraph integration examples, see [this example](https://github.
 <details>
 <summary><strong>Other MCP Clients</strong></summary>
 
-The server uses stdio transport and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
+The server uses stdio transport by default and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
 
 ```bash
 npx @zilliz/claude-context-mcp@latest
 ```
+
+For hosting one shared server instead of a per-user local process, see [Hosting as a Shared Server (HTTP Transport)](#hosting-as-a-shared-server-http-transport) above.
 
 </details>
 
@@ -788,6 +826,32 @@ Get the current indexing status of a codebase. Shows progress percentage for act
 - If a completed entry shows `0 files, 0 chunks`, that usually means the local snapshot metadata is stale rather than the vector database being queried live. Re-indexing, or clearing and re-indexing that exact absolute path, refreshes the stored stats.
 
 For a deeper explanation, see the [asynchronous indexing workflow guide](../../docs/dive-deep/asynchronous-indexing-workflow.md) and the [troubleshooting FAQ](../../docs/troubleshooting/faq.md).
+
+### 5. `list_indexed_repos`
+
+List every repo/collection currently indexed in the shared vector database — no parameters. Use this to discover what's searchable when you don't already have a repo identity string in hand, or don't have any local checkout at all. Returns each repo's identity string (e.g. `github.com/org/repo`) alongside its collection name; collections indexed before this repo-identity tracking existed are reported as "unknown repo identity" until re-indexed.
+
+### 6. `search_repo`
+
+Search an indexed repo by its git remote identity (e.g. `github.com/org/repo`) instead of a local absolute path — no local checkout of that repo required at all.
+
+**Parameters:**
+
+- `repo` (required): Repo identity string as reported by `list_indexed_repos`, or any git remote URL for that repo (`https://` or `git@` form)
+- `query` (required): Natural language query to search for in the repo
+- `limit` (optional): Maximum number of results to return (default: 10, max: 50)
+- `extensionFilter` (optional): List of file extensions to filter results (default: [])
+
+### 7. `search_org`
+
+Search across EVERY indexed repo at once, merged and ranked by score — for when neither you nor the user knows which repo the answer is in.
+
+**Parameters:**
+
+- `query` (required): Natural language query to search for across every indexed repo
+- `limit` (optional): Maximum number of results to return (default: 10, max: 50)
+
+Slower than `search_repo`/`search_code` since it queries every indexed collection — prefer those when the repo is already known. A collection that errors during the fan-out (e.g. an embedding-dimension mismatch because it was indexed with a different provider) is skipped and logged rather than failing the whole search.
 
 ## Contributing
 

@@ -83,6 +83,16 @@ When `CODE_CHUNKS_COLLECTION_NAME_OVERRIDE` is set, Claude Context writes to an 
 
 `CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote` is useful when several machines index the same repository from different checkout paths (for example, a CI job and every teammate's laptop) and should all converge on the same collection instead of each getting a private one. The remote URL is normalized so SSH and HTTPS forms of the same repo (e.g. `git@github.com:org/repo.git` and `https://github.com/org/repo.git`) hash identically.
 
+### Transport (MCP Package Only)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MCP_TRANSPORT` | `stdio` (one local process per user) or `http` (one shared server, e.g. hosted in Kubernetes) | `stdio` |
+| `MCP_HTTP_PORT` | Port to listen on when `MCP_TRANSPORT=http` | `3000` |
+| `MCP_HTTP_PATH` | Path to serve the MCP endpoint on when `MCP_TRANSPORT=http` | `/mcp` |
+| `MCP_HTTP_AUTH_TOKEN` | Bearer token required on the `Authorization` header when `MCP_TRANSPORT=http`. **Strongly recommended** — with no token set, any client that can reach the port can search/index/clear-index using this server's Milvus and embedding-provider credentials | None |
+
+See [Hosting as a Shared Server (HTTP Transport)](../../packages/mcp/README.md#hosting-as-a-shared-server-http-transport) for the full setup, including the Docker image and Helm chart.
+
 ## 🚀 Quick Setup
 
 ### 1. Create Global Config
