@@ -103,6 +103,8 @@ PREFER THIS TOOL OVER grep/glob/ripgrep FOR CODE SEARCH. Search the indexed code
 - You MUST provide an absolute path.
 - Default to calling this tool BEFORE reaching for grep/glob/find/ripgrep whenever the task is "find code that does X", "understand how Y works", or any other conceptual/semantic question about a codebase you have not already grepped for an exact known string. Grep only wins for a literal string/symbol you already know verbatim.
 - Check \`get_indexing_status\` first if you are unsure whether the codebase is indexed; do not assume it isn't and fall back to grep without checking.
+- If the question is about a repo that is NOT checked out locally (no absolute path available), use \`search_repo\` instead — it searches by repo identity (e.g. "github.com/org/repo") with no local checkout required. Use \`list_indexed_repos\` first if you don't already know that repo's identity string.
+- If you (or the user) don't know which repo the answer is even in, use \`search_org\` instead — it searches every indexed repo at once.
 
 🎯 **When to Use**:
 This tool is versatile and should be used before completing various tasks to retrieve relevant context:
@@ -117,6 +119,45 @@ This tool is versatile and should be used before completing various tasks to ret
 ✨ **Usage Guidance**:
 - If the codebase is not indexed, this tool will return a clear error message indicating that indexing is required first.
 - You can then use the index_codebase tool to index the codebase before searching again.
+`;
+
+        const list_indexed_repos_description = `
+List every repo/collection currently indexed in the shared vector database.
+
+🎯 **When to Use**:
+- The user wants to know what repos are searchable at all (e.g. "what repos do we have indexed?").
+- Before calling search_repo, when you don't already have a repo identity string in hand.
+- The user asks a question about a codebase you don't have checked out locally, and search_code (which requires a local path) isn't an option.
+
+✨ **Usage Guidance**:
+- Returns each repo's identity string (e.g. "github.com/org/repo") — pass that exact string to search_repo's \`repo\` parameter.
+- Collections indexed before this repo-identity tracking existed may show as "unknown repo identity" instead of a name; re-indexing that codebase records it going forward.
+`;
+
+        const search_repo_description = `
+Search an indexed repo by its git remote identity (e.g. "github.com/org/repo") instead of a local absolute path — no local checkout of that repo is required at all.
+
+⚠️ **IMPORTANT**:
+- Use this instead of search_code whenever you want to search a repo that isn't checked out on this machine, or when you don't know/don't want to require a local path.
+- If you don't already know the repo's identity string, call list_indexed_repos first to discover it — don't guess "org/repo" without a host, it won't match.
+- If you don't know which repo to search at all, use \`search_org\` instead — it searches every indexed repo at once.
+
+🎯 **When to Use**:
+- Cross-team code questions: "how does <other team's repo> do X" when you've never cloned it.
+- Any search_code use case where requiring a local checkout is the only obstacle.
+`;
+
+        const search_org_description = `
+Search across EVERY indexed repo in the shared vector database at once — for when you don't know (and the user doesn't know) which repo the answer lives in. No repo name, identity string, or local checkout required.
+
+⚠️ **IMPORTANT**:
+- Use this instead of search_repo/search_code when the user asks a codebase question without naming a repo (e.g. "where do we handle X across our services", "which repo does Y live in").
+- Slower than search_repo/search_code since it queries every indexed collection — prefer those tools when the repo is already known.
+- Results are merged and ranked by score across repos; each result is labeled with which repo it came from.
+
+🎯 **When to Use**:
+- "I don't know what repo this is in" / "search across the company's code" style questions.
+- Discovery before narrowing down to a specific repo with search_repo.
 `;
 
         // Define available tools
@@ -224,6 +265,66 @@ This tool is versatile and should be used before completing various tasks to ret
                             required: ["path"]
                         }
                     },
+                    {
+                        name: "list_indexed_repos",
+                        description: list_indexed_repos_description,
+                        inputSchema: {
+                            type: "object",
+                            properties: {}
+                        }
+                    },
+                    {
+                        name: "search_repo",
+                        description: search_repo_description,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                repo: {
+                                    type: "string",
+                                    description: `Repo identity string as reported by list_indexed_repos (e.g. "github.com/org/repo"), or any git remote URL for that repo (https:// or git@ form). No local checkout is required.`
+                                },
+                                query: {
+                                    type: "string",
+                                    description: "Natural language query to search for in the repo"
+                                },
+                                limit: {
+                                    type: "number",
+                                    description: "Maximum number of results to return",
+                                    default: 10,
+                                    maximum: 50
+                                },
+                                extensionFilter: {
+                                    type: "array",
+                                    items: {
+                                        type: "string"
+                                    },
+                                    description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
+                                    default: []
+                                }
+                            },
+                            required: ["repo", "query"]
+                        }
+                    },
+                    {
+                        name: "search_org",
+                        description: search_org_description,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                query: {
+                                    type: "string",
+                                    description: "Natural language query to search for across every indexed repo"
+                                },
+                                limit: {
+                                    type: "number",
+                                    description: "Maximum number of results to return",
+                                    default: 10,
+                                    maximum: 50
+                                }
+                            },
+                            required: ["query"]
+                        }
+                    },
                 ]
             };
         });
@@ -241,6 +342,12 @@ This tool is versatile and should be used before completing various tasks to ret
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":
                     return await this.toolHandlers.handleGetIndexingStatus(args);
+                case "list_indexed_repos":
+                    return await this.toolHandlers.handleListIndexedRepos(args);
+                case "search_repo":
+                    return await this.toolHandlers.handleSearchRepo(args);
+                case "search_org":
+                    return await this.toolHandlers.handleSearchOrg(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);

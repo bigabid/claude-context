@@ -12,3 +12,9 @@ export interface SemanticSearchResult {
     language: string;
     score: number;
 }
+
+export interface OrgSearchResult extends SemanticSearchResult {
+    collectionName: string;
+    repo?: string;
+    codebasePath?: string;
+}

@@ -36,6 +36,183 @@ export class ToolHandlers {
      * the client treats 0/0 as "not indexed" and triggers force reindex, which
      * deletes real data and rewrites 0/0 — an infinite loop. See Issue #295.
      */
+    /**
+     * Validate and build a Milvus filter expression from a search tool's
+     * extensionFilter list. Shared by path-based and repo-based search.
+     */
+    private buildExtensionFilterExpr(extensionFilter: any): { filterExpr?: string; error?: string } {
+        if (!Array.isArray(extensionFilter) || extensionFilter.length === 0) {
+            return {};
+        }
+        const cleaned = extensionFilter
+            .filter((v: any) => typeof v === 'string')
+            .map((v: string) => v.trim())
+            .filter((v: string) => v.length > 0);
+        const invalid = cleaned.filter((e: string) => !(e.startsWith('.') && e.length > 1 && !/\s/.test(e)));
+        if (invalid.length > 0) {
+            return { error: `Error: Invalid file extensions in extensionFilter: ${JSON.stringify(invalid)}. Use proper extensions like '.ts', '.py'.` };
+        }
+        const quoted = cleaned.map((e: string) => `'${e}'`).join(', ');
+        return { filterExpr: `fileExtension in [${quoted}]` };
+    }
+
+    /**
+     * Search a repo by its git remote identity string (e.g. "github.com/org/repo")
+     * instead of a local codebase path — no local checkout required at all.
+     * Use list_indexed_repos to discover valid identity strings.
+     */
+    public async handleSearchRepo(args: any) {
+        const { repo, query, limit = 10, extensionFilter } = args;
+        const resultLimit = limit || 10;
+
+        try {
+            if (typeof repo !== 'string' || repo.trim().length === 0) {
+                return {
+                    content: [{ type: "text", text: `Error: 'repo' is required and must be a non-empty string (e.g. "github.com/org/repo"). Use list_indexed_repos to see available values.` }],
+                    isError: true
+                };
+            }
+
+            const hasVectorIndex = await this.context.hasIndexForRepo(repo);
+            if (!hasVectorIndex) {
+                return {
+                    content: [{ type: "text", text: `Error: No indexed collection found for repo '${repo}'. Use list_indexed_repos to see available repos, or index_codebase from a local checkout to create one.` }],
+                    isError: true
+                };
+            }
+
+            const filterResult = this.buildExtensionFilterExpr(extensionFilter);
+            if (filterResult.error) {
+                return { content: [{ type: 'text', text: filterResult.error }], isError: true };
+            }
+
+            const searchResults = await this.context.semanticSearchByRepo(
+                repo,
+                query,
+                Math.min(resultLimit, 50),
+                0.3,
+                filterResult.filterExpr
+            );
+
+            if (searchResults.length === 0) {
+                return {
+                    content: [{ type: "text", text: `No results found for query: "${query}" in repo '${repo}'` }]
+                };
+            }
+
+            const formattedResults = searchResults.map((result: any, index: number) => {
+                const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
+                const context = truncateContent(result.content, 5000);
+
+                return `${index + 1}. Code snippet (${result.language}) [${repo}]\n` +
+                    `   Location: ${location}\n` +
+                    `   Rank: ${index + 1}\n` +
+                    `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
+            }).join('\n');
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `Found ${searchResults.length} results for query: "${query}" in repo '${repo}'\n\n${formattedResults}`
+                }]
+            };
+        } catch (error) {
+            const errorMessage = typeof error === 'string' ? error : (error instanceof Error ? error.message : String(error));
+            return {
+                content: [{ type: "text", text: `Error searching repo '${repo}': ${errorMessage}` }],
+                isError: true
+            };
+        }
+    }
+
+    /**
+     * List every indexed repo/collection in the shared vector DB, so a client
+     * can discover what's searchable without already knowing a repo name or
+     * having any local checkout of it.
+     */
+    public async handleListIndexedRepos(_args: any) {
+        try {
+            const repos = await this.context.listIndexedRepos();
+            if (repos.length === 0) {
+                return {
+                    content: [{ type: "text", text: `No indexed repositories found in the vector database.` }]
+                };
+            }
+
+            const lines = repos.map((r) => {
+                const label = r.repo
+                    ? r.repo
+                    : `(unknown repo identity — indexed from local path "${r.codebasePath ?? 'unknown'}"; re-index to record its git-remote identity)`;
+                return `- ${label}  [collection: ${r.collectionName}]`;
+            });
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `Found ${repos.length} indexed repositor${repos.length === 1 ? 'y' : 'ies'}:\n\n${lines.join('\n')}\n\n` +
+                        `Use the repo value shown above (not the collection name) with the search_repo tool's 'repo' parameter to search one without needing a local checkout.`
+                }]
+            };
+        } catch (error) {
+            const errorMessage = typeof error === 'string' ? error : (error instanceof Error ? error.message : String(error));
+            return {
+                content: [{ type: "text", text: `Error listing indexed repos: ${errorMessage}` }],
+                isError: true
+            };
+        }
+    }
+
+    /**
+     * Search across every indexed repo/collection in the shared vector DB at
+     * once — for when the caller doesn't know (or doesn't need to know) which
+     * repo the answer lives in. No repo name and no local checkout required.
+     */
+    public async handleSearchOrg(args: any) {
+        const { query, limit = 10 } = args;
+
+        try {
+            if (typeof query !== 'string' || query.trim().length === 0) {
+                return {
+                    content: [{ type: "text", text: `Error: 'query' is required and must be a non-empty string.` }],
+                    isError: true
+                };
+            }
+
+            const resultLimit = Math.min(limit || 10, 50);
+            const searchResults = await this.context.semanticSearchAllRepos(query, resultLimit, 0.3);
+
+            if (searchResults.length === 0) {
+                return {
+                    content: [{ type: "text", text: `No results found for query: "${query}" across any indexed repository.` }]
+                };
+            }
+
+            const formattedResults = searchResults.map((result, index: number) => {
+                const label = result.repo ?? result.collectionName;
+                const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
+                const context = truncateContent(result.content, 5000);
+
+                return `${index + 1}. Code snippet (${result.language}) [${label}]\n` +
+                    `   Location: ${location}\n` +
+                    `   Rank: ${index + 1}\n` +
+                    `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
+            }).join('\n');
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `Found ${searchResults.length} results for query: "${query}" across all indexed repositories\n\n${formattedResults}`
+                }]
+            };
+        } catch (error) {
+            const errorMessage = typeof error === 'string' ? error : (error instanceof Error ? error.message : String(error));
+            return {
+                content: [{ type: "text", text: `Error searching across repositories: ${errorMessage}` }],
+                isError: true
+            };
+        }
+    }
+
     private async queryCollectionStats(codebasePath: string): Promise<{ indexedFiles: number; totalChunks: number } | null> {
         try {
             const collectionName = this.context.getCollectionName(codebasePath);
@@ -741,22 +918,14 @@ export class ToolHandlers {
             console.log(`[SEARCH] 🔍 Generating embeddings for query using ${embeddingProvider.getProvider()}...`);
 
             // Build filter expression from extensionFilter list
-            let filterExpr: string | undefined = undefined;
-            if (Array.isArray(extensionFilter) && extensionFilter.length > 0) {
-                const cleaned = extensionFilter
-                    .filter((v: any) => typeof v === 'string')
-                    .map((v: string) => v.trim())
-                    .filter((v: string) => v.length > 0);
-                const invalid = cleaned.filter((e: string) => !(e.startsWith('.') && e.length > 1 && !/\s/.test(e)));
-                if (invalid.length > 0) {
-                    return {
-                        content: [{ type: 'text', text: `Error: Invalid file extensions in extensionFilter: ${JSON.stringify(invalid)}. Use proper extensions like '.ts', '.py'.` }],
-                        isError: true
-                    };
-                }
-                const quoted = cleaned.map((e: string) => `'${e}'`).join(', ');
-                filterExpr = `fileExtension in [${quoted}]`;
+            const filterResult = this.buildExtensionFilterExpr(extensionFilter);
+            if (filterResult.error) {
+                return {
+                    content: [{ type: 'text', text: filterResult.error }],
+                    isError: true
+                };
             }
+            const filterExpr = filterResult.filterExpr;
 
             // Search in the specified codebase
             const searchResults = await this.context.semanticSearch(
