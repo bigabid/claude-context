@@ -15,6 +15,22 @@ console.warn = (...args: any[]) => {
 
 // console.error already goes to stderr by default
 
+// An unreachable Milvus (no VPN, ingress down, etc.) surfaces as a rejected
+// promise or a gRPC channel error deep in a background task (initial sync,
+// periodic sync, the trigger watcher). Node's default behavior for an
+// unhandled rejection/exception is to crash the whole process silently from
+// the MCP client's point of view — Claude Code just sees the connection
+// close, with no indication Milvus was the cause. Log it loudly and keep the
+// server alive instead: the next tool call surfaces a real error, and
+// background sync/reconnection can recover once Milvus comes back.
+process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL] Unhandled promise rejection — server staying alive. This usually means the vector database (Milvus) or embedding endpoint is unreachable:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('[FATAL] Uncaught exception — server staying alive. This usually means the vector database (Milvus) or embedding endpoint is unreachable:', error);
+});
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
