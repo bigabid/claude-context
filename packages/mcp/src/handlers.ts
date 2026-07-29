@@ -1022,9 +1022,30 @@ export class ToolHandlers {
             await this.syncIndexedCodebasesFromCloud();
 
             // Check indexing status using new status system
-            const statusCodebasePath = this.snapshotManager.findTrackedCodebasePath(absolutePath) || absolutePath;
-            const status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
-            const info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+            let statusCodebasePath = this.snapshotManager.findTrackedCodebasePath(absolutePath) || absolutePath;
+            let status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
+            let info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+
+            if (status === 'not_found') {
+                // Fallback: the local snapshot has never seen this path — e.g. a
+                // teammate indexed this same repo (and the same git-remote-keyed
+                // collection) from a different machine. Check the vector DB
+                // directly before reporting "not indexed", and recover the
+                // snapshot when we can confirm a real row count. Mirrors the
+                // same recovery path handleSearchCode already has.
+                const hasVectorIndex = await this.context.hasIndex(absolutePath);
+                if (hasVectorIndex) {
+                    const stats = await this.queryCollectionStats(absolutePath);
+                    if (stats) {
+                        console.warn(`[STATUS] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
+                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                        this.snapshotManager.saveCodebaseSnapshot();
+                        statusCodebasePath = absolutePath;
+                        status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
+                        info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+                    }
+                }
+            }
 
             let statusMessage = '';
 
