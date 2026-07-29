@@ -30,6 +30,11 @@ export interface ContextMcpConfig {
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
     collectionNameOverride?: string;
+    // Transport configuration
+    transport: 'stdio' | 'http';
+    httpPort: number;
+    httpPath: string;
+    httpAuthToken?: string;
 }
 
 // Legacy format (v1) - for backward compatibility
@@ -203,7 +208,12 @@ export function createMcpConfig(): ContextMcpConfig {
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN'),
-        collectionNameOverride: envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE')
+        collectionNameOverride: envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE'),
+        // Transport configuration - defaults to stdio (single-user local process, unchanged behavior)
+        transport: (envManager.get('MCP_TRANSPORT')?.trim().toLowerCase() === 'http') ? 'http' : 'stdio',
+        httpPort: getPositiveIntegerFromEnv('MCP_HTTP_PORT') || 3000,
+        httpPath: envManager.get('MCP_HTTP_PATH') || '/mcp',
+        httpAuthToken: envManager.get('MCP_HTTP_AUTH_TOKEN')
     };
 
     return config;
@@ -214,6 +224,7 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
     console.log(`[MCP] 🚀 Starting Context MCP Server`);
     console.log(`[MCP] Configuration Summary:`);
     console.log(`[MCP]   Server: ${config.name} v${config.version}`);
+    console.log(`[MCP]   Transport: ${config.transport}${config.transport === 'http' ? ` (port ${config.httpPort}, path ${config.httpPath}, auth: ${config.httpAuthToken ? 'enabled' : '⚠️  DISABLED'})` : ''}`);
     console.log(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
     console.log(`[MCP]   Embedding Model: ${config.embeddingModel}`);
     console.log(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
@@ -275,7 +286,18 @@ Options:
 Environment Variables:
   MCP_SERVER_NAME         Server name
   MCP_SERVER_VERSION      Server version
-  
+
+  Transport Configuration:
+  MCP_TRANSPORT           'stdio' (default, single local process per user) or 'http'
+                          (for hosting one shared server, e.g. in a k8s cluster)
+  MCP_HTTP_PORT           Port to listen on when MCP_TRANSPORT=http (default: 3000)
+  MCP_HTTP_PATH           Path to serve the MCP endpoint on (default: /mcp)
+  MCP_HTTP_AUTH_TOKEN     Bearer token required on the Authorization header when
+                          MCP_TRANSPORT=http. Strongly recommended when exposing this
+                          server on a network — with no token set, ANY client that can
+                          reach the port can search/index/clear-index using this
+                          server's Milvus and embedding-provider credentials.
+
   Embedding Provider Configuration:
   EMBEDDING_PROVIDER      Embedding provider: OpenAI, VoyageAI, Gemini, Ollama, OpenRouter, Bedrock (default: OpenAI)
   EMBEDDING_MODEL         Embedding model name (works for all providers)

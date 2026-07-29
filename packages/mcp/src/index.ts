@@ -31,8 +31,10 @@ process.on('uncaughtException', (error) => {
     console.error('[FATAL] Uncaught exception — server staying alive. This usually means the vector database (Milvus) or embedding endpoint is unreachable:', error);
 });
 
+import * as http from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
     ListToolsRequestSchema,
     CallToolRequestSchema
@@ -49,13 +51,19 @@ import { ToolHandlers } from "./handlers.js";
 
 class ContextMcpServer {
     private server: Server;
+    private config: ContextMcpConfig;
     private context: Context;
     private snapshotManager: SnapshotManager;
     private syncManager: SyncManager;
     private toolHandlers: ToolHandlers;
 
     constructor(config: ContextMcpConfig) {
-        // Initialize MCP server
+        this.config = config;
+
+        // Initialize MCP server (used directly for stdio transport; the http
+        // transport spins up a fresh Server + registered tools per request —
+        // see startHttpTransport — since StreamableHTTPServerTransport in
+        // stateless mode expects one Server per connect() call, not a shared one).
         this.server = new Server(
             {
                 name: config.name,
@@ -96,10 +104,17 @@ class ContextMcpServer {
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
 
-        this.setupTools();
+        this.setupTools(this.server);
     }
 
-    private setupTools() {
+    /**
+     * Registers the ListTools/CallTool handlers on a given Server instance.
+     * Called once for the stdio transport's long-lived Server, and once per
+     * request for the http transport's per-request Server — always reusing
+     * this same shared this.toolHandlers (and the Context/vectorDatabase it
+     * wraps), so tool logic and state are never duplicated per request.
+     */
+    private setupTools(server: Server) {
         const index_description = `
 Index a codebase directory to enable semantic search using a configurable code splitter.
 
@@ -177,7 +192,7 @@ Search across EVERY indexed repo in the shared vector database at once — for w
 `;
 
         // Define available tools
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
@@ -346,7 +361,7 @@ Search across EVERY indexed repo in the shared vector database at once — for w
         });
 
         // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
             switch (name) {
@@ -380,17 +395,134 @@ Search across EVERY indexed repo in the shared vector database at once — for w
         // requests so clients never observe the poisoning state. See Issue #295.
         await this.toolHandlers.validateLegacyZeroEntries();
 
-        const transport = new StdioServerTransport();
-        console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');
+        if (this.config.transport === 'http') {
+            await this.startHttpTransport();
+        } else {
+            const transport = new StdioServerTransport();
+            console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');
 
-        await this.server.connect(transport);
-        console.log("MCP server started and listening on stdio.");
-        console.log('[SYNC-DEBUG] Server connection established successfully');
+            await this.server.connect(transport);
+            console.log("MCP server started and listening on stdio.");
+            console.log('[SYNC-DEBUG] Server connection established successfully');
+        }
 
-        // Start background sync after server is connected
+        // Start background sync after server is connected. Note: in http mode
+        // this still syncs codebases from THIS process's local filesystem —
+        // there is no shared filesystem across replicas, so background sync
+        // (and index_codebase) is only meaningful for codebases actually
+        // checked out where this server process runs.
         console.log('[SYNC-DEBUG] Initializing background sync...');
         this.syncManager.startBackgroundSync();
         console.log('[SYNC-DEBUG] MCP server initialization complete');
+    }
+
+    /**
+     * Serves MCP over Streamable HTTP in stateless mode: every request gets
+     * its own Server + Transport pair (registered against the same shared
+     * this.toolHandlers/Context), so any request can be handled by any
+     * process/replica with no session affinity or in-memory session store
+     * required — this is what makes it safe to run behind a plain load
+     * balancer with multiple replicas.
+     */
+    private async startHttpTransport(): Promise<void> {
+        const { httpPort, httpPath, httpAuthToken } = this.config;
+
+        if (!httpAuthToken) {
+            console.error(
+                `[HTTP] ⚠️  MCP_HTTP_AUTH_TOKEN is not set. This server will accept requests from ` +
+                `ANY client that can reach port ${httpPort} with no authentication, using this ` +
+                `server's Milvus and embedding-provider credentials. Set MCP_HTTP_AUTH_TOKEN before ` +
+                `exposing this beyond localhost.`
+            );
+        }
+
+        const httpServer = http.createServer((req, res) => {
+            void this.handleHttpRequest(req, res, httpPath, httpAuthToken);
+        });
+
+        await new Promise<void>((resolve, reject) => {
+            httpServer.once('error', reject);
+            httpServer.listen(httpPort, () => {
+                console.log(`[HTTP] MCP server listening on port ${httpPort}, path ${httpPath}`);
+                resolve();
+            });
+        });
+    }
+
+    private async handleHttpRequest(
+        req: http.IncomingMessage,
+        res: http.ServerResponse,
+        httpPath: string,
+        httpAuthToken: string | undefined
+    ): Promise<void> {
+        const url = req.url?.split('?')[0];
+
+        if (req.method === 'GET' && url === '/healthz') {
+            res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+            return;
+        }
+
+        if (url !== httpPath) {
+            res.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Not found' }));
+            return;
+        }
+
+        if (httpAuthToken) {
+            const authHeader = req.headers['authorization'];
+            if (authHeader !== `Bearer ${httpAuthToken}`) {
+                res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Unauthorized' }));
+                return;
+            }
+        }
+
+        if (req.method !== 'POST') {
+            res.writeHead(405, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Method not allowed' }));
+            return;
+        }
+
+        let rawBody: string;
+        try {
+            rawBody = await new Promise<string>((resolve, reject) => {
+                const chunks: Buffer[] = [];
+                req.on('data', (chunk) => chunks.push(chunk));
+                req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+                req.on('error', reject);
+            });
+        } catch (error) {
+            console.error('[HTTP] Failed to read request body:', error);
+            res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Failed to read request body' }));
+            return;
+        }
+
+        let parsedBody: unknown;
+        try {
+            parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : undefined;
+        } catch (error) {
+            res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Invalid JSON body' }));
+            return;
+        }
+
+        const requestServer = new Server(
+            { name: this.config.name, version: this.config.version },
+            { capabilities: { tools: {} } }
+        );
+        this.setupTools(requestServer);
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
+        res.on('close', () => {
+            transport.close();
+            requestServer.close();
+        });
+
+        try {
+            await requestServer.connect(transport);
+            await transport.handleRequest(req, res, parsedBody);
+        } catch (error) {
+            console.error('[HTTP] Error handling MCP request:', error);
+            if (!res.headersSent) {
+                res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Internal server error' }));
+            }
+        }
     }
 }
 
