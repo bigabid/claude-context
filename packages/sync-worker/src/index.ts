@@ -2,7 +2,7 @@ import { Context, MilvusVectorDatabase, FileSynchronizer } from "@bigabid/claude
 import { loadConfig, SyncWorkerConfig } from "./config.js";
 import { createEmbeddingInstance } from "./embedding.js";
 import { createGithubAppAuth, mintInstallationToken, discoverRepos, DiscoveredRepo } from "./github-app.js";
-import { cloneOrPull } from "./git-sync.js";
+import { cloneOrPull, EmptyRepoError } from "./git-sync.js";
 import { runWithConcurrency } from "./concurrency-pool.js";
 
 type AppAuth = ReturnType<typeof createGithubAppAuth>;
@@ -12,7 +12,19 @@ async function processRepo(context: Context, appAuth: AppAuth, config: SyncWorke
     // Fresh token per repo - a whole-org run can exceed a single
     // installation token's ~1h lifetime, so don't reuse discoveryToken here.
     const repoToken = await mintInstallationToken(appAuth, config.githubAppInstallationId);
-    const repoPath = await cloneOrPull(repo, repoToken, config.reposDir);
+    let repoPath: string;
+    try {
+        repoPath = await cloneOrPull(repo, repoToken, config.reposDir);
+    } catch (error) {
+        if (error instanceof EmptyRepoError) {
+            // Not a real failure - the GitHub API reports a default_branch
+            // even for a repo with zero commits. Nothing to index; skip
+            // quietly instead of it showing up as FAILED every run.
+            console.log(`[SYNC] [${repo.fullName}] skipped: ${error.message}`);
+            return;
+        }
+        throw error;
+    }
 
     const alreadyIndexed = await context.hasIndex(repoPath);
 
