@@ -33,9 +33,23 @@ Plus the same embedding-provider and Milvus variables as `@bigabid/claude-contex
 | `SYNC_INCLUDE_FORKS` | Set `true` to index forks too | `false` |
 | `SYNC_REPOS_DIR` | Local checkout directory (should be a persistent volume, so repeated runs are incremental rather than re-cloning everything) | `/data/repos` |
 
-## GitHub App permissions
+## Creating the GitHub App
 
-- Repository contents: **Read-only**
-- Metadata: **Read-only**
+This worker cannot create the App itself (it's an interactive web flow). Steps:
+
+1. Go to `https://github.com/organizations/<your-org>/settings/apps/new`
+2. Fill in:
+   - GitHub App name: e.g. `claude-context-sync-worker` (must be globally unique across all of GitHub — add a suffix if taken)
+   - Homepage URL: any URL (e.g. your repo's) — required field, doesn't need to be functional
+   - Uncheck the **Webhook active** checkbox — not needed
+3. Under **Repository permissions**, set:
+   - **Contents**: Read-only
+   - **Metadata**: Read-only (auto-selected)
+4. Under "Where can this GitHub App be installed?", choose **Only on this account**
+5. Click **Create GitHub App**
+6. Note the **App ID** shown at the top of the app's settings page → this is `GITHUB_APP_ID`
+7. Scroll to **Private keys** → **Generate a private key** → downloads a `.pem` file. Save it — there's no way to re-download it, only generate a new one. This file's contents are `GITHUB_APP_PRIVATE_KEY`/`GITHUB_APP_PRIVATE_KEY_PATH`
+8. Click **Install App** in the left sidebar → pick your org → **All repositories** (or select specific ones) → **Install**
+9. After installing, the URL you land on is `github.com/organizations/<org>/settings/installations/<INSTALLATION_ID>` — that number is `GITHUB_APP_INSTALLATION_ID`
 
 The installation token doubles as the git credential (`https://x-access-token:<token>@github.com/...`, sent as a per-invocation `http.extraheader` — never written to disk) — no separate deploy key needed.
