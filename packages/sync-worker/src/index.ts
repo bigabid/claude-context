@@ -1,4 +1,4 @@
-import { Context, MilvusVectorDatabase } from "@bigabid/claude-context-core";
+import { Context, MilvusVectorDatabase, FileSynchronizer } from "@bigabid/claude-context-core";
 import { loadConfig } from "./config.js";
 import { createEmbeddingInstance } from "./embedding.js";
 import { createGithubAppAuth, mintInstallationToken, discoverRepos } from "./github-app.js";
@@ -36,16 +36,38 @@ async function main(): Promise<void> {
             const repoToken = await mintInstallationToken(appAuth, config.githubAppInstallationId);
             const repoPath = await cloneOrPull(repo, repoToken, config.reposDir);
 
-            // Idempotent: no-ops (no drop, no data loss) if the collection
-            // already exists. reindexByChange alone won't create it for a repo
-            // that's never been indexed by anyone before - only indexCodebase
-            // normally does, but calling it here would always run a full
-            // (re-)index instead of the incremental diff reindexByChange gives us.
-            await context.getPreparedCollection(repoPath);
+            const alreadyIndexed = await context.hasIndex(repoPath);
 
-            console.log(`[SYNC] [${repo.fullName}] reindexing (path: ${repoPath})...`);
-            const stats = await context.reindexByChange(repoPath);
-            console.log(`[SYNC] [${repo.fullName}] done: +${stats.added} -${stats.removed} ~${stats.modified}`);
+            if (!alreadyIndexed) {
+                // First time this repo has ever been indexed (by anyone, since
+                // CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote means "indexed"
+                // is a property of the repo, not this checkout). reindexByChange
+                // is NOT sufficient here: when no merkle snapshot exists yet, it
+                // builds its baseline from the CURRENT on-disk state and treats
+                // that as "already synced", reporting zero changes and leaving
+                // the collection empty forever - it's built for catching changes
+                // since a prior indexCodebase, not for doing that first index.
+                // Mirrors packages/mcp/src/handlers.ts's handleIndexCodebase:
+                // build+register the synchronizer BEFORE indexing, so later runs'
+                // reindexByChange (via its own synchronizer-recreation fallback,
+                // reading the snapshot file this just wrote) diffs correctly.
+                console.log(`[SYNC] [${repo.fullName}] never indexed before - running full index...`);
+                const ignorePatterns = await context.getEffectiveIgnorePatterns(repoPath);
+                const supportedExtensions = context.getEffectiveSupportedExtensions();
+                const synchronizer = new FileSynchronizer(repoPath, ignorePatterns, supportedExtensions);
+                await synchronizer.initialize();
+
+                await context.getPreparedCollection(repoPath);
+                const collectionName = context.getCollectionName(repoPath);
+                context.setSynchronizer(collectionName, synchronizer);
+
+                const stats = await context.indexCodebase(repoPath);
+                console.log(`[SYNC] [${repo.fullName}] done: indexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks`);
+            } else {
+                console.log(`[SYNC] [${repo.fullName}] reindexing (path: ${repoPath})...`);
+                const stats = await context.reindexByChange(repoPath);
+                console.log(`[SYNC] [${repo.fullName}] done: +${stats.added} -${stats.removed} ~${stats.modified}`);
+            }
             synced++;
         } catch (error) {
             console.error(`[SYNC] [${repo.fullName}] FAILED:`, error);
