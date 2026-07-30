@@ -10,8 +10,8 @@ Claude Context is an MCP plugin that adds semantic code search to AI coding agen
 
 pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 <24 and pnpm >=10.
 
-- `packages/core` (`@zilliz/claude-context-core`) — the indexing engine. All real logic lives here; the other packages are thin frontends over it.
-- `packages/mcp` (`@zilliz/claude-context-mcp`) — MCP server, the primary product. ESM (`"type": "module"`). Defaults to stdio transport (one local process per user); `MCP_TRANSPORT=http` runs it as a shared Streamable HTTP server instead (stateless per request, so safe behind a plain load balancer) — see `Dockerfile` (repo root, multi-arch) and `deploy/helm/claude-context-mcp` (Helm chart) for hosting that mode, e.g. in EKS.
+- `packages/core` (`@bigabid/claude-context-core`) — the indexing engine. All real logic lives here; the other packages are thin frontends over it. Published to GitHub Packages (`npm.pkg.github.com`, `@bigabid` scope) — publish with `pnpm publish` (not plain `npm publish`, which doesn't rewrite the `workspace:*` dependency on core to a real version).
+- `packages/mcp` (`@bigabid/claude-context-mcp`) — MCP server, the primary product. ESM (`"type": "module"`). Defaults to stdio transport (one local process per user); `MCP_TRANSPORT=http` runs it as a shared Streamable HTTP server instead (stateless per request, so safe behind a plain load balancer) — see `Dockerfile` (repo root, multi-arch) and `deploy/helm/claude-context-mcp` (Helm chart) for hosting that mode, e.g. in EKS.
 - `packages/sync-worker` (`@bigabid/claude-context-sync-worker`) — standalone batch job (Kubernetes CronJob, not a service): auto-discovers a GitHub org's repos via a GitHub App installation, clones/pulls each onto a PVC, and calls `reindexByChange` with `CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote` so it converges on the same shared collections laptops/CI use. Meant to be the *sole* indexer for whichever repos it covers — see the package README for why running it alongside laptop-side `index_codebase` on the same repo is unsafe. See `Dockerfile.sync-worker` (repo root, multi-arch) and `deploy/helm/claude-context-sync-worker`.
 - `packages/vscode-extension` (`semanticcodesearch`) — VSCode extension. Bundled with webpack; stubs out Node-only deps (Milvus gRPC, native AST) in `src/stubs/`.
 - `packages/chrome-extension` — browser build; overrides `@zilliz/milvus2-sdk-node` to `false` (no gRPC in browser).
@@ -22,7 +22,7 @@ pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 <24 and pnpm >=1
 ```bash
 pnpm install
 pnpm build                 # build all packages (examples built last)
-pnpm build:core            # build a single package: also build:mcp, build:vscode
+pnpm build:core            # build a single package: also build:mcp, build:vscode, build:sync-worker
 pnpm dev                   # watch all; or dev:core / dev:mcp / dev:vscode
 pnpm lint                  # eslint across packages; lint:fix to autofix
 pnpm typecheck             # tsc --noEmit across packages
@@ -35,19 +35,20 @@ Packages depend on `core` via `workspace:*`, so **rebuild core (`pnpm build:core
 
 - **core** uses Jest + ts-jest. Test files are colocated as `*.test.ts` in `src/`.
   ```bash
-  pnpm --filter @zilliz/claude-context-core test                     # all (runs in band)
-  pnpm --filter @zilliz/claude-context-core test -- context.abort    # by filename
-  pnpm --filter @zilliz/claude-context-core test -- -t "pattern"     # by test name
+  pnpm --filter @bigabid/claude-context-core test                     # all (runs in band)
+  pnpm --filter @bigabid/claude-context-core test -- context.abort    # by filename
+  pnpm --filter @bigabid/claude-context-core test -- -t "pattern"     # by test name
   ```
-- **mcp** uses the Node built-in test runner via tsx (no Jest):
+- **mcp** and **sync-worker** use the Node built-in test runner via tsx (no Jest):
   ```bash
-  pnpm --filter @zilliz/claude-context-mcp test                      # runs src/**/*.test.ts
+  pnpm --filter @bigabid/claude-context-mcp test                      # runs src/**/*.test.ts
+  pnpm --filter @bigabid/claude-context-sync-worker test
   ```
 
 ### Running the MCP server locally
 
 ```bash
-pnpm --filter @zilliz/claude-context-mcp start        # tsx src/index.ts
+pnpm --filter @bigabid/claude-context-mcp start        # tsx src/index.ts
 ```
 Configuration is entirely via environment variables (see `.env.example` and `packages/mcp/src/config.ts`). Key vars: `EMBEDDING_PROVIDER` (OpenAI | VoyageAI | Gemini | Ollama | OpenRouter | Bedrock), provider API key, `EMBEDDING_MODEL`, `MILVUS_ADDRESS` and/or `MILVUS_TOKEN` (address can be auto-resolved from a Zilliz token), `CODE_CHUNKS_COLLECTION_NAME_OVERRIDE`, `CODE_CHUNKS_COLLECTION_KEY_SOURCE` (set to `git-remote` to key a codebase's collection off its git `origin` remote instead of its local path, so multiple checkouts of the same repo share one collection).
 
@@ -62,6 +63,8 @@ Configuration is entirely via environment variables (see `.env.example` and `pac
 - **Splitter** (`src/splitter/`) — `AstCodeSplitter` (tree-sitter, the default at 2500/300 chunk/overlap) which falls back to `LangChainCodeSplitter` for unsupported languages or parse failures.
 
 The public surface (`indexCodebase`, `reindexByChange`, `semanticSearch`, `clearIndex`, `hasIndex`) is re-exported from `src/index.ts`. Indexing reads files honoring ignore rules, splits them, embeds in batches, and upserts vectors. Collection name is derived from a hash of the absolute codebase path (overridable).
+
+Repo-identity variants let a caller search or discover collections with no local checkout at all: `getCollectionNameForRepo`/`hasIndexForRepo`/`semanticSearchByRepo` take a repo identity string (e.g. `github.com/org/repo`) instead of a local path — `hasIndexForRepo`/`semanticSearchByRepo` fall back to scanning `listIndexedRepos()` if the direct hash misses, so a `HYBRID_MODE`/`CODE_CHUNKS_COLLECTION_NAME_OVERRIDE` mismatch between indexer and searcher doesn't produce a false "not indexed". `listIndexedRepos()` enumerates every `code_chunks_*`/`hybrid_code_chunks_*` collection and recovers each one's repo identity/local path from its Milvus collection description, written by `prepareCollection` as `repo:<identity>;codebasePath:<path>` (identity first, path last — an unescaped `;` in a path can't corrupt the parse since the path is always the last field, matched greedily to end-of-string). `semanticSearchAllRepos` fans out across every indexed collection concurrently (embedding the query once, reused across all of them), merges and ranks by score, and skips — rather than fails on — a collection that errors (e.g. an embedding-dimension mismatch from a different provider).
 
 Two error types carry control-flow meaning and should be preserved when touching the pipeline:
 - `IndexAbortError` — cooperative cancellation via `AbortSignal`.
