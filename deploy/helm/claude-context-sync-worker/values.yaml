@@ -76,6 +76,12 @@ github:
   includeArchived: false
   includeForks: false
 
+# How many repos to clone/index at once - repos are independent (separate
+# collections, separate checkouts), so this doesn't need to be 1. Tune down
+# if this overwhelms the embedding endpoint or Milvus; tune up once you've
+# confirmed they handle it, to get through a large org faster.
+concurrency: 4
+
 # Non-secret env vars (EMBEDDING_PROVIDER, EMBEDDING_MODEL, etc). These MUST
 # match whatever produced the existing collections (same HYBRID_MODE, same
 # embedding model/dimension) or this worker creates parallel collections

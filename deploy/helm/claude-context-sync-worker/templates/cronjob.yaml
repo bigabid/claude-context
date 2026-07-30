@@ -57,6 +57,8 @@ spec:
                   value: {{ .Values.github.includeArchived | quote }}
                 - name: SYNC_INCLUDE_FORKS
                   value: {{ .Values.github.includeForks | quote }}
+                - name: SYNC_CONCURRENCY
+                  value: {{ .Values.concurrency | quote }}
                 # Repo checkouts AND the merkle sync-state that makes reindexByChange
                 # incremental (~/.context/merkle/*.json) both live on the same PVC,
                 # so both survive between CronJob runs - not just the git checkouts.

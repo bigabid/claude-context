@@ -16,6 +16,9 @@ export interface SyncWorkerConfig {
     // Local checkout
     reposDir: string;
 
+    // How many repos to process concurrently
+    concurrency: number;
+
     // Embedding provider (mirrors packages/mcp/src/config.ts's shape)
     embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'Bedrock';
     embeddingModel: string;
@@ -111,6 +114,7 @@ export function loadConfig(): SyncWorkerConfig {
         includeForks: (envManager.get('SYNC_INCLUDE_FORKS') || '').toLowerCase() === 'true',
 
         reposDir: envManager.get('SYNC_REPOS_DIR') || '/data/repos',
+        concurrency: getPositiveIntegerFromEnv('SYNC_CONCURRENCY') || 4,
 
         embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as SyncWorkerConfig['embeddingProvider']) || 'OpenAI',
         embeddingModel: envManager.get('EMBEDDING_MODEL') || '',

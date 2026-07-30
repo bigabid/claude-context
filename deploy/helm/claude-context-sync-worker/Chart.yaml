@@ -2,5 +2,5 @@ apiVersion: v2
 name: claude-context-sync-worker
 description: Runs @bigabid/claude-context-sync-worker as a scheduled CronJob - auto-discovers a GitHub org's repos via a GitHub App and keeps them indexed
 type: application
-version: 0.1.2
-appVersion: "0.1.1"
+version: 0.1.3
+appVersion: "0.1.2"

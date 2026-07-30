@@ -8,9 +8,10 @@ Meant to run as the **sole indexer** for whichever repos it's installed against.
 
 1. Authenticates as the configured GitHub App and mints an installation access token.
 2. Lists every repo the installation can see (`GET /installation/repositories`), filtering out archived repos and forks by default.
-3. For each repo: shallow clone (or fetch + hard reset if already checked out) onto `SYNC_REPOS_DIR`, authenticating the git operation with a **fresh** installation token (these expire in ~1 hour — a whole-org run can outlast a single token, so one is minted per repo, not once at startup).
+3. Processes repos through a bounded worker pool (`SYNC_CONCURRENCY`, default 4) — repos are independent (separate collections, separate checkouts), so a handful run at once instead of strictly one-at-a-time; each worker picks up the next repo as soon as it finishes, so a few slow/huge repos don't stall the ones behind them. For each repo: shallow clone (or fetch + hard reset if already checked out) onto `SYNC_REPOS_DIR`, authenticating the git operation with a **fresh** installation token (these expire in ~1 hour — a whole-org run can outlast a single token, so one is minted per repo, not once at startup).
 4. Calls `reindexByChange` (falls back to creating the collection first if the repo has never been indexed by anyone).
-5. Logs a summary and exits non-zero only if every repo failed (so a CronJob distinguishes "nothing changed" from "totally broken").
+5. A failing repo (e.g. a transient embedding-endpoint error) is logged and skipped rather than stopping the run — since it never got indexed, it's picked up again on the next scheduled run.
+6. Logs a summary and exits non-zero only if every repo failed (so a CronJob distinguishes "nothing changed" from "totally broken").
 
 ## Required environment variables
 
@@ -32,6 +33,7 @@ Plus the same embedding-provider and Milvus variables as `@bigabid/claude-contex
 | `SYNC_INCLUDE_ARCHIVED` | Set `true` to index archived repos too | `false` |
 | `SYNC_INCLUDE_FORKS` | Set `true` to index forks too | `false` |
 | `SYNC_REPOS_DIR` | Local checkout directory (should be a persistent volume, so repeated runs are incremental rather than re-cloning everything) | `/data/repos` |
+| `SYNC_CONCURRENCY` | How many repos to clone/index at once | `4` |
 
 ## Creating the GitHub App
 
