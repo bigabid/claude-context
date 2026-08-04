@@ -778,6 +778,8 @@ For hosting one shared server instead of a per-user local process, see [Hosting 
 
 ## Available Tools
 
+> Tools 1–3 below (`index_codebase`, `search_code`, `clear_index`) plus `get_indexing_status` operate on a local filesystem path and only make sense for the stdio transport (one process per user's checkout). When hosted over the [Streamable HTTP transport](#hosting-as-a-shared-server-http-transport), the server is shared/stateless with no checkout of its own, so these four are hidden from the tool list and rejected if called anyway — only `list_indexed_repos`, `search_repo`, and `search_org` are exposed in that mode. (`search_code` in particular would silently misbehave over http rather than just being a worse choice: its collection lookup reads `.git/config` from the given path *on the server's own filesystem*, which doesn't exist there, so it would always report "not indexed".)
+
 ### 1. `index_codebase`
 
 Index a codebase directory for hybrid search (BM25 + dense vector).
@@ -844,14 +846,14 @@ Search an indexed repo by its git remote identity (e.g. `github.com/org/repo`) i
 
 ### 7. `search_org`
 
-Search across EVERY indexed repo at once, merged and ranked by score — for when neither you nor the user knows which repo the answer is in.
+Search across EVERY indexed repo at once, merged and ranked by score. This is the default tool for any question that isn't anchored to a specific repo you can already name — not just a last resort for "neither you nor the user knows which repo the answer is in." Being inside a local checkout doesn't mean the answer lives there; don't guess a repo name to avoid this tool when you're unsure — an uncertain guess searches the wrong place, this doesn't.
 
 **Parameters:**
 
 - `query` (required): Natural language query to search for across every indexed repo
 - `limit` (optional): Maximum number of results to return (default: 10, max: 50)
 
-Slower than `search_repo`/`search_code` since it queries every indexed collection — prefer those when the repo is already known. A collection that errors during the fan-out (e.g. an embedding-dimension mismatch because it was indexed with a different provider) is skipped and logged rather than failing the whole search.
+Slower than `search_repo`/`search_code` since it queries every indexed collection — that's a normal, expected cost, not a reason to avoid it when the repo isn't already known. A collection that errors during the fan-out (e.g. an embedding-dimension mismatch because it was indexed with a different provider) is skipped and logged rather than failing the whole search.
 
 ## Contributing
 

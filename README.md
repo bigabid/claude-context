@@ -494,6 +494,8 @@ For detailed explanation of file inclusion and exclusion rules, and how to custo
 
 ### Available Tools
 
+> `index_codebase`, `search_code`, `clear_index`, and `get_indexing_status` operate on a local filesystem path, so they only apply to the default stdio transport (one process per user's checkout). When hosted over the [Streamable HTTP transport](packages/mcp/README.md#hosting-as-a-shared-server-http-transport) instead, those four are hidden and rejected — only `list_indexed_repos`, `search_repo`, and `search_org` are exposed, since the shared server has no local checkout of its own to search.
+
 #### 1. `index_codebase`
 
 Index a codebase directory for hybrid search (BM25 + dense vector).
@@ -509,6 +511,20 @@ Clear the search index for a specific codebase.
 #### 4. `get_indexing_status`
 
 Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.
+
+#### 5. `list_indexed_repos`
+
+List every repo/collection currently indexed in the shared vector database — no local checkout needed.
+
+#### 6. `search_repo`
+
+Search a specific, named indexed repo by its git remote identity (e.g. `github.com/org/repo`) instead of a local absolute path.
+
+#### 7. `search_org`
+
+Search across EVERY indexed repo at once, merged and ranked by score. This is the default choice for any question that isn't already anchored to a repo you can name — not just a fallback for when you're totally lost.
+
+See the [MCP package README](packages/mcp/README.md#available-tools) for full parameter details on all seven tools.
 
 ---
 

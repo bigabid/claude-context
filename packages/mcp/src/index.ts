@@ -128,14 +128,14 @@ Index a codebase directory to enable semantic search using a configurable code s
 
 
         const search_description = `
-PREFER THIS TOOL OVER grep/glob/ripgrep FOR CODE SEARCH. Search the indexed codebase using natural language queries within a specified absolute path.
+Semantic search of ONE repo — the codebase at the given absolute path, i.e. the checkout you are actively working in. PREFER THIS OVER grep/glob/ripgrep for conceptual/semantic search of THAT repo. For questions that aren't scoped to this one checkout, use search_org (any/unknown repo) or search_repo (a different named repo) instead.
 
 ⚠️ **IMPORTANT**:
 - You MUST provide an absolute path.
 - Default to calling this tool BEFORE reaching for grep/glob/find/ripgrep whenever the task is "find code that does X", "understand how Y works", or any other conceptual/semantic question about a codebase you have not already grepped for an exact known string. Grep only wins for a literal string/symbol you already know verbatim.
 - Check \`get_indexing_status\` first if you are unsure whether the codebase is indexed; do not assume it isn't and fall back to grep without checking.
 - If the question is about a repo that is NOT checked out locally (no absolute path available), use \`search_repo\` instead — it searches by repo identity (e.g. "github.com/org/repo") with no local checkout required. Use \`list_indexed_repos\` first if you don't already know that repo's identity string.
-- If you (or the user) don't know which repo the answer is even in, use \`search_org\` instead — it searches every indexed repo at once.
+- This searches ONLY the repo at the given path. If the answer might live in another repo, or the question is about "our services / our system" broadly rather than this specific checkout, use \`search_org\` — being inside a checkout does not mean the answer is in it. Stay with search_code only when the answer is clearly in THIS repo.
 
 🎯 **When to Use**:
 This tool is versatile and should be used before completing various tasks to retrieve relevant context:
@@ -163,15 +163,16 @@ List every repo/collection currently indexed in the shared vector database.
 ✨ **Usage Guidance**:
 - Returns each repo's identity string (e.g. "github.com/org/repo") — pass that exact string to search_repo's \`repo\` parameter.
 - Collections indexed before this repo-identity tracking existed may show as "unknown repo identity" instead of a name; re-indexing that codebase records it going forward.
+- Note: you do NOT need this before search_org — that tool searches all repos with no identity string. Only reach here when you intend to name a single repo for search_repo.
 `;
 
         const search_repo_description = `
 Search an indexed repo by its git remote identity (e.g. "github.com/org/repo") instead of a local absolute path — no local checkout of that repo is required at all.
 
 ⚠️ **IMPORTANT**:
-- Use this instead of search_code whenever you want to search a repo that isn't checked out on this machine, or when you don't know/don't want to require a local path.
+- Use this to search a specific, named repo that isn't checked out on this machine (identity confirmed via list_indexed_repos). "Named" is the key word — you must know which repo.
 - If you don't already know the repo's identity string, call list_indexed_repos first to discover it — don't guess "org/repo" without a host, it won't match.
-- If you don't know which repo to search at all, use \`search_org\` instead — it searches every indexed repo at once.
+- Do NOT guess a repo identity. If you are not certain which repo holds the answer, use \`search_org\` instead — it searches every indexed repo at once, so an uncertain guess is never necessary.
 
 🎯 **When to Use**:
 - Cross-team code questions: "how does <other team's repo> do X" when you've never cloned it.
@@ -179,22 +180,45 @@ Search an indexed repo by its git remote identity (e.g. "github.com/org/repo") i
 `;
 
         const search_org_description = `
-Search across EVERY indexed repo in the shared vector database at once — for when you don't know (and the user doesn't know) which repo the answer lives in. No repo name, identity string, or local checkout required.
+Search across EVERY indexed repo in the shared vector database at once. This is the DEFAULT tool for any code question that is NOT anchored to a specific repo you can already name — no repo name, identity string, or local checkout required.
 
 ⚠️ **IMPORTANT**:
-- Use this instead of search_repo/search_code when the user asks a codebase question without naming a repo (e.g. "where do we handle X across our services", "which repo does Y live in").
-- Slower than search_repo/search_code since it queries every indexed collection — prefer those tools when the repo is already known.
+- Use this whenever the question is cross-cutting — "where/whether/how do we do X across our services", "which repo does Y live in", "how does our system handle Z" — i.e. anything not pinned to one named repo.
+- Being inside a local checkout does NOT mean the answer is in that repo. If the question is about "our system / our services" broadly rather than the code you are actively editing, search here — do not narrow to the local repo with search_code by reflex.
+- Do NOT guess a repo name to use search_repo/search_code when you are unsure. A wrong guess searches the wrong place (or errors as "not indexed"); searching all repos at once does not. When in doubt about which repo, this is the correct tool, not a last resort.
+- Prefer search_repo/search_code ONLY when the answer is clearly scoped to one specific repo you can name (search_repo) or to the checkout you are actively working in (search_code).
+- Queries every indexed collection, so it is somewhat slower than a single-repo search. This is a normal, expected cost — not a reason to avoid it.
 - Results are merged and ranked by score across repos; each result is labeled with which repo it came from.
 
 🎯 **When to Use**:
-- "I don't know what repo this is in" / "search across the company's code" style questions.
-- Discovery before narrowing down to a specific repo with search_repo.
+- Cross-repo / "which repo" / "across our stack" questions — anything not tied to one named repo.
+- You searched a single repo (search_code/search_repo) and found nothing relevant — escalate here instead of giving up or falling back to grep.
+- You are about to guess a repo name for search_repo but aren't certain it's right — use this instead.
+- Org-wide discovery, whether or not you later narrow to one repo.
 `;
+
+        // These tools operate on a local filesystem path, which only makes
+        // sense for the stdio transport (one process per user's checkout).
+        // Over http, the server is shared/stateless with no local checkout of
+        // its own, so these are hidden from the tool list and rejected if
+        // called anyway - only the repo-identity query tools (search_repo,
+        // search_org, list_indexed_repos) are exposed in that mode.
+        //
+        // search_code is local-only too, not just by convention but because
+        // it's actually broken over http: Context.getGitRemoteIdentity()
+        // resolves a repo's collection by reading .git/config from the given
+        // path ON THE SERVER'S OWN FILESYSTEM. A caller's local absolute path
+        // (e.g. their laptop checkout) doesn't exist on the shared server, so
+        // that lookup silently fails and falls back to hashing the raw path
+        // string - a collection the sync-worker never created. The tool
+        // wouldn't just be a worse choice than search_repo/search_org over
+        // http, it would silently return "not indexed" for everything.
+        const localOnlyToolNames = new Set(["index_codebase", "clear_index", "get_indexing_status", "search_code"]);
+        const isHttp = this.config.transport === 'http';
 
         // Define available tools
         server.setRequestHandler(ListToolsRequestSchema, async () => {
-            return {
-                tools: [
+            const allTools = [
                     {
                         name: "index_codebase",
                         description: index_description,
@@ -356,13 +380,20 @@ Search across EVERY indexed repo in the shared vector database at once — for w
                             required: ["query"]
                         }
                     },
-                ]
+            ];
+
+            return {
+                tools: isHttp ? allTools.filter((tool) => !localOnlyToolNames.has(tool.name)) : allTools
             };
         });
 
         // Handle tool execution
         server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
+
+            if (isHttp && localOnlyToolNames.has(name)) {
+                throw new Error(`Tool '${name}' operates on a local filesystem path and is not available over the http transport.`);
+            }
 
             switch (name) {
                 case "index_codebase":
