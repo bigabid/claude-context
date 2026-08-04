@@ -1,6 +1,6 @@
 {
     "name": "@bigabid/claude-context-sync-worker",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "description": "Standalone batch job: auto-discovers a GitHub org's repos via a GitHub App and keeps them indexed in the shared Claude Context vector DB",
     "type": "module",
     "main": "dist/index.js",
