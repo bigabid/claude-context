@@ -1,6 +1,6 @@
 {
     "name": "@bigabid/claude-context-mcp",
-    "version": "0.1.23",
+    "version": "0.1.24",
     "description": "Model Context Protocol integration for Claude Context",
     "type": "module",
     "main": "dist/index.js",
