@@ -53,6 +53,11 @@ export class EmbeddingError extends Error {
     }
 }
 
+// Cap on concurrent Milvus round trips during semanticSearchAllRepos's
+// fan-out. Without a bound, an org with hundreds of indexed collections
+// opens that many concurrent requests per search_org call.
+const ORG_SEARCH_CONCURRENCY = 15;
+
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
@@ -268,8 +273,8 @@ export class Context {
     /**
      * Public wrapper for prepareCollection private method
      */
-    async getPreparedCollection(codebasePath: string): Promise<void> {
-        return this.prepareCollection(codebasePath);
+    async getPreparedCollection(codebasePath: string, forceReindex: boolean = false): Promise<void> {
+        return this.prepareCollection(codebasePath, forceReindex);
     }
 
     /**
@@ -673,23 +678,46 @@ export class Context {
         console.log(`[Context] 🔍 Org-wide search across ${repos.length} collections: "${query}"`);
         const precomputedEmbedding = await this.embedding.embed(query);
 
-        const perCollectionResults = await Promise.all(repos.map(async (r): Promise<OrgSearchResult[]> => {
+        const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<OrgSearchResult[]> => {
             const isHybrid = r.collectionName.startsWith('hybrid_code_chunks_');
             try {
-                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding });
+                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true });
                 return results.map((result) => ({ ...result, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath }));
             } catch (error) {
                 console.warn(`[Context] ⚠️  Skipping collection '${r.collectionName}' in org-wide search (likely an embedding-dimension or hybrid-mode mismatch with this searcher's provider): ${error}`);
                 return [];
             }
-        }));
+        });
 
         const merged = perCollectionResults.flat().sort((a, b) => b.score - a.score);
         console.log(`[Context] ✅ Org-wide search found ${merged.length} results across ${repos.length} collections, returning top ${Math.min(topK, merged.length)}`);
         return merged.slice(0, topK);
     }
 
-    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector }): Promise<SemanticSearchResult[]> {
+    /**
+     * Runs `task` over every item in `items` with at most `concurrency` in
+     * flight at once, preserving input order in the returned results. Used to
+     * bound fan-out (e.g. org-wide search across every indexed collection)
+     * so it doesn't open thousands of concurrent Milvus round trips at once.
+     */
+    private async mapWithConcurrency<T, R>(items: T[], concurrency: number, task: (item: T) => Promise<R>): Promise<R[]> {
+        const results: R[] = new Array(items.length);
+        let nextIndex = 0;
+
+        async function worker(): Promise<void> {
+            while (true) {
+                const index = nextIndex++;
+                if (index >= items.length) return;
+                results[index] = await task(items[index]);
+            }
+        }
+
+        const workerCount = Math.max(1, Math.min(concurrency, items.length));
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        return results;
+    }
+
+    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector; skipProbeQuery?: boolean }): Promise<SemanticSearchResult[]> {
         const isHybrid = options?.isHybrid ?? this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}"`);
@@ -703,12 +731,14 @@ export class Context {
         }
 
         if (isHybrid === true) {
-            try {
-                // Check collection stats to see if it has data
-                const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
-                console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
-            } catch (error) {
-                console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
+            if (!options?.skipProbeQuery) {
+                try {
+                    // Check collection stats to see if it has data
+                    const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
+                    console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
+                } catch (error) {
+                    console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
+                }
             }
 
             // 1. Generate query vector (reuse the caller's, if given, to avoid

@@ -20,6 +20,10 @@ const rawLogLevel = (process.env.MCP_LOG_LEVEL || 'info').trim().toLowerCase();
 const resolvedLogLevel: LogLevelName = (rawLogLevel in LOG_LEVELS ? rawLogLevel : 'info') as LogLevelName;
 const logLevelThreshold = LOG_LEVELS[resolvedLogLevel];
 const DEBUG_TAG_PATTERN = /\[[\w-]*DEBUG\]/;
+// HTTP transport auth is optional (MCP_HTTP_AUTH_TOKEN unset only logs a
+// warning), so cap request body size to stop an unauthenticated client from
+// OOMing the pod with a large POST.
+const MAX_HTTP_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 
 function shouldLog(level: LogLevelName): boolean {
     return LOG_LEVELS[level] >= logLevelThreshold;
@@ -542,17 +546,35 @@ Search across EVERY indexed repo in the shared vector database at once. This is 
             return;
         }
 
+        const contentLength = Number(req.headers['content-length']);
+        if (Number.isFinite(contentLength) && contentLength > MAX_HTTP_BODY_BYTES) {
+            res.writeHead(413, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Payload too large' }));
+            req.destroy();
+            return;
+        }
+
         let rawBody: string;
         try {
             rawBody = await new Promise<string>((resolve, reject) => {
                 const chunks: Buffer[] = [];
-                req.on('data', (chunk) => chunks.push(chunk));
+                let totalBytes = 0;
+                req.on('data', (chunk: Buffer) => {
+                    totalBytes += chunk.length;
+                    if (totalBytes > MAX_HTTP_BODY_BYTES) {
+                        req.destroy();
+                        reject(Object.assign(new Error('Payload too large'), { statusCode: 413 }));
+                        return;
+                    }
+                    chunks.push(chunk);
+                });
                 req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
                 req.on('error', reject);
             });
-        } catch (error) {
+        } catch (error: any) {
             console.error('[HTTP] Failed to read request body:', error);
-            res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Failed to read request body' }));
+            const statusCode = error?.statusCode === 413 ? 413 : 400;
+            const message = statusCode === 413 ? 'Payload too large' : 'Failed to read request body';
+            res.writeHead(statusCode, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: message }));
             return;
         }
 

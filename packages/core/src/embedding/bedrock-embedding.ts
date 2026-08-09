@@ -51,8 +51,22 @@ export class BedrockEmbedding extends Embedding {
 
         const model = config.model || 'amazon.titan-embed-text-v2:0';
         const modelInfo = BedrockEmbedding.getSupportedModels()[model];
-        this.dimension = config.dimension || modelInfo?.dimension || 1024;
+        this.dimension = this.resolveDimension(config.dimension, model, modelInfo);
         this.maxTokens = modelInfo?.maxTokens || 8192;
+    }
+
+    /**
+     * Only amazon.titan-embed-text-v2:0 actually sends `body.dimensions` to
+     * Bedrock (see embedTitanSingle). Honoring a dimension override for any
+     * other model would report a dimension that the model never actually
+     * produces, permanently mismatching the Milvus collection it's used to create.
+     */
+    private resolveDimension(configDimension: number | undefined, model: string, modelInfo?: BedrockModelInfo): number {
+        if (configDimension && !model.includes('titan-embed-text-v2')) {
+            console.warn(`[BedrockEmbedding] Ignoring dimension override (${configDimension}) for model ${model}: only amazon.titan-embed-text-v2:0 supports a configurable dimension.`);
+            return modelInfo?.dimension || 1024;
+        }
+        return configDimension || modelInfo?.dimension || 1024;
     }
 
     async detectDimension(): Promise<number> {
@@ -61,11 +75,15 @@ export class BedrockEmbedding extends Embedding {
     }
 
     async embed(text: string): Promise<EmbeddingVector> {
-        const [result] = await this.embedBatch([text]);
+        const [result] = await this.embedBatchInternal([text], 'search_query');
         return result;
     }
 
     async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
+        return this.embedBatchInternal(texts, 'search_document');
+    }
+
+    private async embedBatchInternal(texts: string[], inputType: 'search_document' | 'search_query'): Promise<EmbeddingVector[]> {
         if (texts.length === 0) {
             return [];
         }
@@ -75,10 +93,11 @@ export class BedrockEmbedding extends Embedding {
         const family = this.getModelFamily(model);
 
         if (family === 'cohere') {
-            return this.embedCohereBatch(processedTexts, model);
+            return this.embedCohereBatch(processedTexts, model, inputType);
         }
 
         // Titan embedding models only accept a single inputText per InvokeModel call.
+        // Titan has no query/document asymmetry, so inputType doesn't apply.
         const results: EmbeddingVector[] = [];
         for (const text of processedTexts) {
             results.push(await this.embedTitanSingle(text, model));
@@ -108,13 +127,13 @@ export class BedrockEmbedding extends Embedding {
         };
     }
 
-    private async embedCohereBatch(texts: string[], model: string): Promise<EmbeddingVector[]> {
+    private async embedCohereBatch(texts: string[], model: string, inputType: 'search_document' | 'search_query'): Promise<EmbeddingVector[]> {
         const results: EmbeddingVector[] = [];
         for (let i = 0; i < texts.length; i += COHERE_BATCH_LIMIT) {
             const chunk = texts.slice(i, i + COHERE_BATCH_LIMIT);
             const response = await this.invoke(model, {
                 texts: chunk,
-                input_type: 'search_document'
+                input_type: inputType
             });
 
             if (!Array.isArray(response.embeddings)) {
@@ -163,7 +182,7 @@ export class BedrockEmbedding extends Embedding {
     setModel(model: string): void {
         this.config.model = model;
         const modelInfo = BedrockEmbedding.getSupportedModels()[model];
-        this.dimension = this.config.dimension || modelInfo?.dimension || 1024;
+        this.dimension = this.resolveDimension(this.config.dimension, model, modelInfo);
         this.maxTokens = modelInfo?.maxTokens || 8192;
     }
 

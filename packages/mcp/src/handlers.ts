@@ -378,14 +378,15 @@ export class ToolHandlers {
                     let extracted = false;
                     try {
                         const description = await vectorDb.getCollectionDescription(collectionName);
-                        if (description && description.startsWith('codebasePath:')) {
-                            const codebasePath = description.substring('codebasePath:'.length);
-                            if (codebasePath.length > 0) {
-                                console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
-                                cloudCodebases.add(codebasePath);
-                                successfulExtractions++;
-                                extracted = true;
-                            }
+                        // codebasePath is always the last field (see Context.prepareCollection),
+                        // matched greedily to end-of-string - same regex as listIndexedRepos().
+                        const pathMatch = description?.match(/(?:^|;)codebasePath:(.*)$/);
+                        const codebasePath = pathMatch?.[1]?.trim();
+                        if (codebasePath) {
+                            console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
+                            cloudCodebases.add(codebasePath);
+                            successfulExtractions++;
+                            extracted = true;
                         }
                     } catch (descError: any) {
                         console.warn(`[SYNC-CLOUD] ⚠️  Failed to get description for collection ${collectionName}:`, descError.message || descError);

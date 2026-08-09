@@ -53,8 +53,11 @@ resources:
 
 # Repo checkouts AND the merkle sync-state (~/.context/merkle/*.json) that
 # makes reindexByChange incremental both live on this PVC, so both survive
-# between CronJob runs. With persistence.enabled=false, every run is a full
-# re-clone + re-embed of every repo instead of an incremental diff.
+# between CronJob runs. With persistence.enabled=false, the merkle snapshot
+# is gone on every run even though the Milvus collection isn't; processRepo
+# detects that mismatch (collection exists, no on-disk snapshot) and forces
+# a full re-index, so every run is a full re-clone + re-embed of every repo
+# instead of an incremental diff.
 persistence:
   enabled: true
   size: 20Gi

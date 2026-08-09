@@ -238,6 +238,29 @@ export class FileSynchronizer {
     }
 
     /**
+     * Check whether a merkle snapshot file exists on disk for a given codebase
+     * path, without loading or mutating it. Lets callers distinguish "never
+     * indexed" (no Milvus collection) from "indexed before, but the snapshot
+     * was lost" (collection exists, snapshot missing) - the latter needs a
+     * forced full re-index, since reindexByChange would otherwise baseline
+     * against the current on-disk state and report zero changes forever.
+     */
+    static async hasSnapshot(codebasePath: string): Promise<boolean> {
+        const homeDir = os.homedir();
+        const merkleDir = path.join(homeDir, '.context', 'merkle');
+        const normalizedPath = path.resolve(codebasePath);
+        const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
+        const snapshotPath = path.join(merkleDir, `${hash}.json`);
+
+        try {
+            await fs.access(snapshotPath);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
      * Delete snapshot file for a given codebase path
      */
     static async deleteSnapshot(codebasePath: string): Promise<void> {
