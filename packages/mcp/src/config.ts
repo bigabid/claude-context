@@ -286,6 +286,10 @@ Options:
 Environment Variables:
   MCP_SERVER_NAME         Server name
   MCP_SERVER_VERSION      Server version
+  MCP_LOG_LEVEL           'debug', 'info' (default), 'warn', or 'error'. Set to 'warn' or
+                          'error' to quiet a noisy shared HTTP deployment's kubectl logs -
+                          'warn'/'error' also drop normal lifecycle logs (server started,
+                          background sync status), not just internal debug tracing.
 
   Transport Configuration:
   MCP_TRANSPORT           'stdio' (default, single local process per user) or 'http'

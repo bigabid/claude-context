@@ -2,18 +2,49 @@
 
 // CRITICAL: Redirect console outputs to stderr IMMEDIATELY to avoid interfering with MCP JSON protocol
 // Only MCP protocol messages should go to stdout
-const originalConsoleLog = console.log;
-const originalConsoleWarn = console.warn;
+//
+// MCP_LOG_LEVEL (debug|info|warn|error, default info) gates verbosity - this
+// matters most for the shared HTTP deployment, where every log line lands in
+// a shared pod's `kubectl logs`. Rather than retrofitting an explicit level
+// onto every one of this package's ~180 call sites, we classify by how the
+// call was already made: console.error is always shown (never filtered);
+// console.warn is 'warn'; console.log is 'debug' if its message carries a
+// "...DEBUG]" tag (e.g. [DEBUG], [SYNC-DEBUG], [SNAPSHOT-DEBUG] - the existing
+// convention for internal tracing) and 'info' otherwise. Read directly from
+// process.env (not envManager's ~/.context/.env fallback) since this must
+// resolve before any other module - including core, where envManager lives -
+// finishes loading.
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const;
+type LogLevelName = keyof typeof LOG_LEVELS;
+const rawLogLevel = (process.env.MCP_LOG_LEVEL || 'info').trim().toLowerCase();
+const resolvedLogLevel: LogLevelName = (rawLogLevel in LOG_LEVELS ? rawLogLevel : 'info') as LogLevelName;
+const logLevelThreshold = LOG_LEVELS[resolvedLogLevel];
+const DEBUG_TAG_PATTERN = /\[[\w-]*DEBUG\]/;
+
+function shouldLog(level: LogLevelName): boolean {
+    return LOG_LEVELS[level] >= logLevelThreshold;
+}
 
 console.log = (...args: any[]) => {
-    process.stderr.write('[LOG] ' + args.join(' ') + '\n');
+    const message = args.join(' ');
+    const level: LogLevelName = DEBUG_TAG_PATTERN.test(message) ? 'debug' : 'info';
+    if (shouldLog(level)) {
+        process.stderr.write('[LOG] ' + message + '\n');
+    }
 };
 
 console.warn = (...args: any[]) => {
-    process.stderr.write('[WARN] ' + args.join(' ') + '\n');
+    if (shouldLog('warn')) {
+        process.stderr.write('[WARN] ' + args.join(' ') + '\n');
+    }
 };
 
-// console.error already goes to stderr by default
+// console.error already goes to stderr by default, and is never filtered by MCP_LOG_LEVEL.
+
+if (!(rawLogLevel in LOG_LEVELS)) {
+    process.stderr.write(`[WARN] Ignoring invalid MCP_LOG_LEVEL '${rawLogLevel}' (expected debug|info|warn|error) - defaulting to 'info'.\n`);
+}
+process.stderr.write(`[LOG] [MCP] Log level: ${resolvedLogLevel} (set MCP_LOG_LEVEL=warn or =error to reduce noise; this line always prints regardless of level)\n`);
 
 // An unreachable Milvus (no VPN, ingress down, etc.) surfaces as a rejected
 // promise or a gRPC channel error deep in a background task (initial sync,

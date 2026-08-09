@@ -302,6 +302,7 @@ MCP_TRANSPORT=http                    # default: stdio
 MCP_HTTP_PORT=3000                    # default: 3000
 MCP_HTTP_PATH=/mcp                    # default: /mcp
 MCP_HTTP_AUTH_TOKEN=<a-random-secret>  # strongly recommended - see warning below
+MCP_LOG_LEVEL=info                    # default: info - see Logging below
 ```
 
 The server is stateless per request (`sessionIdGenerator: undefined`), so any replica can serve any request — no session affinity or shared session store needed behind a load balancer. A `/healthz` endpoint is included for liveness/readiness probes.
@@ -315,7 +316,11 @@ claude mcp add --transport http claude-context-org https://<your-host>/mcp \
   --header "Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>"
 ```
 
-Note: a shared HTTP server has no access to any user's local git checkouts, so `index_codebase` still needs to run from a machine (or CI job) that has the target repo checked out — the hosted server is for `search_code`/`search_repo`/`search_org`/`list_indexed_repos` against already-indexed collections. To keep those collections fresh automatically instead of relying on someone's laptop, see [`@bigabid/claude-context-sync-worker`](../sync-worker/README.md) — a scheduled job that auto-discovers a GitHub org's repos and indexes them.
+Note: a shared HTTP server has no access to any user's local git checkouts, so `index_codebase`/`clear_index`/`get_indexing_status`/`search_code` are hidden in this mode (they need a local path — see [Available Tools](#available-tools) above) — the hosted server is for `search_repo`/`search_org`/`list_indexed_repos` against already-indexed collections. To keep those collections fresh automatically instead of relying on someone's laptop, see [`@bigabid/claude-context-sync-worker`](../sync-worker/README.md) — a scheduled job that auto-discovers a GitHub org's repos and indexes them.
+
+### Logging
+
+`MCP_LOG_LEVEL` (`debug` | `info` (default) | `warn` | `error`) controls verbosity. This matters most for a shared HTTP deployment, where every log line lands in one pod's `kubectl logs` for every user's requests combined. Set it to `warn` or `error` to drop normal lifecycle logs (startup config summary, background sync status) as well as internal `[...DEBUG]`-tagged tracing — real warnings and errors (auth misconfiguration, unreachable Milvus/embedding endpoint, etc.) are never suppressed.
 
 ### Docker / Kubernetes (EKS)
 
