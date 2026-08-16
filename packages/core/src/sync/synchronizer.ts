@@ -128,11 +128,31 @@ export class FileSynchronizer {
         return dag;
     }
 
-    public async initialize() {
+    /**
+     * @param persistNewSnapshot When a first-time initialize (no snapshot file
+     * yet) generates a fresh baseline, whether to write it to disk immediately
+     * (the default, used by every caller that indexes right after initializing
+     * in the same run). Pass false when the caller needs to do its own
+     * indexing work between initialize() and the point where a snapshot
+     * becomes valid - e.g. a batch job that must not persist "this codebase is
+     * baselined" until indexCodebase has actually succeeded, so a mid-index
+     * crash (OOM, SIGKILL, deadline eviction) leaves no snapshot behind rather
+     * than one describing a repo that was never actually indexed. Call
+     * persistSnapshot() explicitly once indexing succeeds in that case.
+     */
+    public async initialize(persistNewSnapshot: boolean = true) {
         console.log(`Initializing file synchronizer for ${this.rootDir}`);
-        await this.loadSnapshot();
+        await this.loadSnapshot(persistNewSnapshot);
         this.merkleDAG = this.buildMerkleDAG(this.fileHashes);
         console.log(`[Synchronizer] File synchronizer initialized. Loaded ${this.fileHashes.size} file hashes.`);
+    }
+
+    /**
+     * Write the current in-memory snapshot to disk. Only needed after
+     * initialize(false) skipped the automatic first-time save.
+     */
+    public async persistSnapshot(): Promise<void> {
+        await this.saveSnapshot();
     }
 
     public async checkForChanges(): Promise<{ added: string[], removed: string[], modified: string[] }> {
@@ -210,7 +230,7 @@ export class FileSynchronizer {
         console.log(`Saved snapshot to ${this.snapshotPath}`);
     }
 
-    private async loadSnapshot(): Promise<void> {
+    private async loadSnapshot(persistNewSnapshot: boolean = true): Promise<void> {
         try {
             const data = await fs.readFile(this.snapshotPath, 'utf-8');
             const obj = JSON.parse(data);
@@ -230,7 +250,9 @@ export class FileSynchronizer {
                 console.log(`Snapshot file not found at ${this.snapshotPath}. Generating new one.`);
                 this.fileHashes = await this.generateFileHashes(this.rootDir);
                 this.merkleDAG = this.buildMerkleDAG(this.fileHashes);
-                await this.saveSnapshot();
+                if (persistNewSnapshot) {
+                    await this.saveSnapshot();
+                }
             } else {
                 throw error;
             }

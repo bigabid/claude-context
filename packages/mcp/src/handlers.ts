@@ -21,7 +21,7 @@ export class ToolHandlers {
      */
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
 
-    constructor(context: Context, snapshotManager: SnapshotManager) {
+    constructor(context: Context, snapshotManager: SnapshotManager, private readonly isHttp: boolean = false) {
         this.context = context;
         this.snapshotManager = snapshotManager;
         this.currentWorkspace = process.cwd();
@@ -75,8 +75,14 @@ export class ToolHandlers {
 
             const hasVectorIndex = await this.context.hasIndexForRepo(repo);
             if (!hasVectorIndex) {
+                // index_codebase is hidden (and rejected) over the http transport, so
+                // don't send an http caller to a tool it cannot call - point it at the
+                // stdio server instead, matching setupTools's transport-aware wording.
+                const indexHint = this.isHttp
+                    ? 'index it from a local checkout via the stdio server'
+                    : 'index_codebase from a local checkout';
                 return {
-                    content: [{ type: "text", text: `Error: No indexed collection found for repo '${repo}'. Use list_indexed_repos to see available repos, or index_codebase from a local checkout to create one.` }],
+                    content: [{ type: "text", text: `Error: No indexed collection found for repo '${repo}'. Use list_indexed_repos to see available repos, or ${indexHint} to create one.` }],
                     isError: true
                 };
             }

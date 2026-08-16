@@ -307,6 +307,8 @@ MCP_LOG_LEVEL=info                    # default: info - see Logging below
 
 The server is stateless per request (`sessionIdGenerator: undefined`), so any replica can serve any request — no session affinity or shared session store needed behind a load balancer. A `/healthz` endpoint is included for liveness/readiness probes.
 
+Request bodies over 10 MiB are rejected with `413 { "error": "Payload too large" }`.
+
 ⚠️ **`MCP_HTTP_AUTH_TOKEN` is not set by default.** Without it, this server accepts requests from anyone who can reach the port and uses ITS Milvus and embedding-provider credentials to serve them — set it before exposing this beyond localhost. Clients must send it as `Authorization: Bearer <token>`.
 
 Point a client at it instead of spawning a local process, e.g.:

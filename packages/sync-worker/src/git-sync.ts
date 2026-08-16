@@ -105,6 +105,13 @@ export async function cloneOrPull(repo: DiscoveredRepo, token: string, reposDir:
         await runGit(['-C', targetDir, '-c', authArg, 'fetch', '--depth', '1', 'origin', repo.defaultBranch], repo);
         await runGit(['-C', targetDir, 'reset', '--hard', `origin/${repo.defaultBranch}`], repo);
     } else {
+        if (fs.existsSync(targetDir)) {
+            // targetDir survived without a valid .git - a previous run was killed
+            // mid-clone (OOM, activeDeadlineSeconds, node eviction). `git clone`
+            // refuses to write into a non-empty directory, which would wedge this
+            // repo as FAILED on every run until someone manually cleans the PVC.
+            fs.rmSync(targetDir, { recursive: true, force: true });
+        }
         fs.mkdirSync(path.dirname(targetDir), { recursive: true });
         await runGit([
             '-c', authArg,

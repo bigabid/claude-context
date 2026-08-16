@@ -1,6 +1,6 @@
 {
     "name": "@bigabid/claude-context-mcp",
-    "version": "0.1.24",
+    "version": "0.1.25",
     "description": "Model Context Protocol integration for Claude Context",
     "type": "module",
     "main": "dist/index.js",
@@ -13,7 +13,7 @@
         "lint": "eslint src --ext .ts",
         "lint:fix": "eslint src --ext .ts --fix",
         "typecheck": "tsc --noEmit",
-        "test": "node --import tsx --test \"src/**/*.test.ts\"",
+        "test": "node --import tsx --test src/*.test.ts",
         "start": "tsx src/index.ts",
         "start:with-env": "OPENAI_API_KEY=${OPENAI_API_KEY:your-api-key-here} MILVUS_ADDRESS=${MILVUS_ADDRESS:localhost:19530} tsx src/index.ts",
         "prepublishOnly": "pnpm build"

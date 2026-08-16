@@ -134,7 +134,7 @@ class ContextMcpServer {
         // Initialize managers
         this.snapshotManager = new SnapshotManager();
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
-        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager, this.config.transport === 'http');
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
@@ -150,6 +150,25 @@ class ContextMcpServer {
      * wraps), so tool logic and state are never duplicated per request.
      */
     private setupTools(server: Server) {
+        // These tools operate on a local filesystem path, which only makes
+        // sense for the stdio transport (one process per user's checkout).
+        // Over http, the server is shared/stateless with no local checkout of
+        // its own, so these are hidden from the tool list and rejected if
+        // called anyway - only the repo-identity query tools (search_repo,
+        // search_org, list_indexed_repos) are exposed in that mode.
+        //
+        // search_code is local-only too, not just by convention but because
+        // it's actually broken over http: Context.getGitRemoteIdentity()
+        // resolves a repo's collection by reading .git/config from the given
+        // path ON THE SERVER'S OWN FILESYSTEM. A caller's local absolute path
+        // (e.g. their laptop checkout) doesn't exist on the shared server, so
+        // that lookup silently fails and falls back to hashing the raw path
+        // string - a collection the sync-worker never created. The tool
+        // wouldn't just be a worse choice than search_repo/search_org over
+        // http, it would silently return "not indexed" for everything.
+        const localOnlyToolNames = new Set(["index_codebase", "clear_index", "get_indexing_status", "search_code"]);
+        const isHttp = this.config.transport === 'http';
+
         const index_description = `
 Index a codebase directory to enable semantic search using a configurable code splitter.
 
@@ -193,7 +212,7 @@ List every repo/collection currently indexed in the shared vector database.
 🎯 **When to Use**:
 - The user wants to know what repos are searchable at all (e.g. "what repos do we have indexed?").
 - Before calling search_repo, when you don't already have a repo identity string in hand.
-- The user asks a question about a codebase you don't have checked out locally, and search_code (which requires a local path) isn't an option.
+- The user asks a question about a codebase you don't have checked out locally${isHttp ? '' : ", and search_code (which requires a local path) isn't an option"}.
 
 ✨ **Usage Guidance**:
 - Returns each repo's identity string (e.g. "github.com/org/repo") — pass that exact string to search_repo's \`repo\` parameter.
@@ -211,7 +230,7 @@ Search an indexed repo by its git remote identity (e.g. "github.com/org/repo") i
 
 🎯 **When to Use**:
 - Cross-team code questions: "how does <other team's repo> do X" when you've never cloned it.
-- Any search_code use case where requiring a local checkout is the only obstacle.
+- ${isHttp ? 'Any case where a local checkout would otherwise be required.' : 'Any search_code use case where requiring a local checkout is the only obstacle.'}
 `;
 
         const search_org_description = `
@@ -219,37 +238,20 @@ Search across EVERY indexed repo in the shared vector database at once. This is 
 
 ⚠️ **IMPORTANT**:
 - Use this whenever the question is cross-cutting — "where/whether/how do we do X across our services", "which repo does Y live in", "how does our system handle Z" — i.e. anything not pinned to one named repo.
-- Being inside a local checkout does NOT mean the answer is in that repo. If the question is about "our system / our services" broadly rather than the code you are actively editing, search here — do not narrow to the local repo with search_code by reflex.
-- Do NOT guess a repo name to use search_repo/search_code when you are unsure. A wrong guess searches the wrong place (or errors as "not indexed"); searching all repos at once does not. When in doubt about which repo, this is the correct tool, not a last resort.
-- Prefer search_repo/search_code ONLY when the answer is clearly scoped to one specific repo you can name (search_repo) or to the checkout you are actively working in (search_code).
+${isHttp
+    ? '- If the question is about "our system / our services" broadly rather than one specific repo, search here — do not narrow to a single named repo by reflex.'
+    : '- Being inside a local checkout does NOT mean the answer is in that repo. If the question is about "our system / our services" broadly rather than the code you are actively editing, search here — do not narrow to the local repo with search_code by reflex.'}
+- Do NOT guess a repo name to use ${isHttp ? 'search_repo' : 'search_repo/search_code'} when you are unsure. A wrong guess searches the wrong place (or errors as "not indexed"); searching all repos at once does not. When in doubt about which repo, this is the correct tool, not a last resort.
+- Prefer ${isHttp ? 'search_repo' : 'search_repo/search_code'} ONLY when the answer is clearly scoped to one specific repo you can name${isHttp ? '.' : ' (search_repo) or to the checkout you are actively working in (search_code).'}
 - Queries every indexed collection, so it is somewhat slower than a single-repo search. This is a normal, expected cost — not a reason to avoid it.
 - Results are merged and ranked by score across repos; each result is labeled with which repo it came from.
 
 🎯 **When to Use**:
 - Cross-repo / "which repo" / "across our stack" questions — anything not tied to one named repo.
-- You searched a single repo (search_code/search_repo) and found nothing relevant — escalate here instead of giving up or falling back to grep.
+- You searched a single repo (${isHttp ? 'search_repo' : 'search_code/search_repo'}) and found nothing relevant — escalate here instead of giving up or falling back to grep.
 - You are about to guess a repo name for search_repo but aren't certain it's right — use this instead.
 - Org-wide discovery, whether or not you later narrow to one repo.
 `;
-
-        // These tools operate on a local filesystem path, which only makes
-        // sense for the stdio transport (one process per user's checkout).
-        // Over http, the server is shared/stateless with no local checkout of
-        // its own, so these are hidden from the tool list and rejected if
-        // called anyway - only the repo-identity query tools (search_repo,
-        // search_org, list_indexed_repos) are exposed in that mode.
-        //
-        // search_code is local-only too, not just by convention but because
-        // it's actually broken over http: Context.getGitRemoteIdentity()
-        // resolves a repo's collection by reading .git/config from the given
-        // path ON THE SERVER'S OWN FILESYSTEM. A caller's local absolute path
-        // (e.g. their laptop checkout) doesn't exist on the shared server, so
-        // that lookup silently fails and falls back to hashing the raw path
-        // string - a collection the sync-worker never created. The tool
-        // wouldn't just be a worse choice than search_repo/search_org over
-        // http, it would silently return "not indexed" for everything.
-        const localOnlyToolNames = new Set(["index_codebase", "clear_index", "get_indexing_status", "search_code"]);
-        const isHttp = this.config.transport === 'http';
 
         // Define available tools
         server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -546,10 +548,15 @@ Search across EVERY indexed repo in the shared vector database at once. This is 
             return;
         }
 
+        // Destroying `req` tears down the underlying socket immediately, which
+        // can cut off the 413 response before it's flushed - the client sees
+        // ECONNRESET instead of the JSON error. Drain the request (discarding
+        // its data) and mark the connection for close once the response is
+        // done, instead of destroying the socket out from under it.
         const contentLength = Number(req.headers['content-length']);
         if (Number.isFinite(contentLength) && contentLength > MAX_HTTP_BODY_BYTES) {
-            res.writeHead(413, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Payload too large' }));
-            req.destroy();
+            res.writeHead(413, { 'Content-Type': 'application/json', 'Connection': 'close' }).end(JSON.stringify({ error: 'Payload too large' }));
+            req.resume();
             return;
         }
 
@@ -558,10 +565,15 @@ Search across EVERY indexed repo in the shared vector database at once. This is 
             rawBody = await new Promise<string>((resolve, reject) => {
                 const chunks: Buffer[] = [];
                 let totalBytes = 0;
+                let oversized = false;
                 req.on('data', (chunk: Buffer) => {
+                    if (oversized) {
+                        return;
+                    }
                     totalBytes += chunk.length;
                     if (totalBytes > MAX_HTTP_BODY_BYTES) {
-                        req.destroy();
+                        oversized = true;
+                        chunks.length = 0;
                         reject(Object.assign(new Error('Payload too large'), { statusCode: 413 }));
                         return;
                     }
@@ -574,7 +586,12 @@ Search across EVERY indexed repo in the shared vector database at once. This is 
             console.error('[HTTP] Failed to read request body:', error);
             const statusCode = error?.statusCode === 413 ? 413 : 400;
             const message = statusCode === 413 ? 'Payload too large' : 'Failed to read request body';
-            res.writeHead(statusCode, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: message }));
+            const headers: http.OutgoingHttpHeaders = { 'Content-Type': 'application/json' };
+            if (statusCode === 413) {
+                headers['Connection'] = 'close';
+                req.resume();
+            }
+            res.writeHead(statusCode, headers).end(JSON.stringify({ error: message }));
             return;
         }
 

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { OpenAIEmbedding, OpenAIEmbeddingConfig, VoyageAIEmbedding, VoyageAIEmbeddingConfig, OllamaEmbedding, OllamaEmbeddingConfig, GeminiEmbedding, GeminiEmbeddingConfig, BedrockEmbedding, BedrockEmbeddingConfig, MilvusConfig, SplitterType, SplitterConfig, AstCodeSplitter, LangChainCodeSplitter } from '@zilliz/claude-context-core';
+import { OpenAIEmbedding, OpenAIEmbeddingConfig, VoyageAIEmbedding, VoyageAIEmbeddingConfig, OllamaEmbedding, OllamaEmbeddingConfig, GeminiEmbedding, GeminiEmbeddingConfig, BedrockEmbedding, BedrockEmbeddingConfig, MilvusConfig, SplitterType, SplitterConfig, AstCodeSplitter, LangChainCodeSplitter } from '@bigabid/claude-context-core';
 
 // Simplified Milvus configuration interface for frontend
 export interface MilvusWebConfig {

@@ -1,6 +1,6 @@
 {
     "name": "@bigabid/claude-context-sync-worker",
-    "version": "0.1.5",
+    "version": "0.1.6",
     "description": "Standalone batch job: auto-discovers a GitHub org's repos via a GitHub App and keeps them indexed in the shared Claude Context vector DB",
     "type": "module",
     "main": "dist/index.js",
@@ -10,7 +10,7 @@
         "lint": "eslint src --ext .ts",
         "lint:fix": "eslint src --ext .ts --fix",
         "typecheck": "tsc --noEmit",
-        "test": "node --import tsx --test \"src/**/*.test.ts\"",
+        "test": "node --import tsx --test src/*.test.ts",
         "start": "tsx src/index.ts"
     },
     "dependencies": {

@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { Context } from './context';
 import { VectorDatabase } from './vectordb';
+import { envManager } from './utils/env-manager';
 
 const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
     createCollection: jest.fn().mockResolvedValue(undefined),
@@ -49,9 +50,15 @@ describe('Context.getCollectionName with CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-r
         originalKeySource = process.env.CODE_CHUNKS_COLLECTION_KEY_SOURCE;
         originalHybridMode = process.env.HYBRID_MODE;
         process.env.HYBRID_MODE = 'false';
+        // envManager.get() falls back to ~/.context/.env when a var isn't in
+        // process.env. On a machine with CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote
+        // set there (this PR's own recommended setup), that fallback would leak
+        // into these tests. Restrict resolution to process.env for this suite.
+        jest.spyOn(envManager, 'get').mockImplementation((name: string) => process.env[name]);
     });
 
     afterEach(async () => {
+        jest.restoreAllMocks();
         if (originalKeySource === undefined) {
             delete process.env.CODE_CHUNKS_COLLECTION_KEY_SOURCE;
         } else {
