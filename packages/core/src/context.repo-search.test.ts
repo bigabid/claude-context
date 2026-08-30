@@ -254,7 +254,10 @@ describe('Context repo-identity search (no local checkout required)', () => {
 
         expect(embedding.embedCallCount).toBe(1);
         expect(results).toHaveLength(2);
-        expect(results[0]).toMatchObject({ relativePath: 'b.py', repo: 'github.com/bigabid/repo-b', collectionName: 'hybrid_code_chunks_bbbbbbbb', score: 0.9 });
+        // The hybrid candidate's RRF score (0.9 from the mock) is replaced by its
+        // cosine similarity to the query ([1,0,0]·[1,0,0] = 1) for the cross-repo
+        // ranking; the dense-only collection's score is already a cosine and kept.
+        expect(results[0]).toMatchObject({ relativePath: 'b.py', repo: 'github.com/bigabid/repo-b', collectionName: 'hybrid_code_chunks_bbbbbbbb', score: 1 });
         expect(results[1]).toMatchObject({ relativePath: 'a.py', repo: 'github.com/bigabid/repo-a', collectionName: 'code_chunks_aaaaaaaa', score: 0.3 });
     });
 

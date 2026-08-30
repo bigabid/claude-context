@@ -659,9 +659,17 @@ export class Context {
     /**
      * Search every indexed repo/collection in the vector DB at once — for when
      * the caller doesn't know (or doesn't want to specify) which repo to search.
-     * Merges and ranks results across collections by score. See `listIndexedRepos`
-     * for what "every indexed repo" means and `search_repo`/`semanticSearchByRepo`
-     * for searching one repo by identity.
+     * See `listIndexedRepos` for what "every indexed repo" means and
+     * `search_repo`/`semanticSearchByRepo` for searching one repo by identity.
+     *
+     * Candidates are selected per collection (hybrid RRF within a repo), but the
+     * cross-collection ranking uses dense cosine similarity to the query, NOT the
+     * per-collection RRF score. RRF scores are rank positions in disguise
+     * (1/(k+rank)): every collection's #1 chunk gets the identical value whether
+     * it's a perfect match or the least-bad chunk of a tiny repo, so merging by
+     * them made the org-wide top-K an arbitrary tie-break that buried relevant
+     * code under READMEs (DEV_FS-3937). Cosine scores come from one shared
+     * embedding model, so they are comparable across collections.
      *
      * Each collection is searched independently and a failure there (e.g. an
      * embedding-dimension mismatch because it was indexed with a different
@@ -678,20 +686,56 @@ export class Context {
         console.log(`[Context] 🔍 Org-wide search across ${repos.length} collections: "${query}"`);
         const precomputedEmbedding = await this.embedding.embed(query);
 
+        let unscorableCandidates = 0;
         const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<OrgSearchResult[]> => {
             const isHybrid = r.collectionName.startsWith('hybrid_code_chunks_');
             try {
-                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true });
-                return results.map((result) => ({ ...result, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath }));
+                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: isHybrid });
+                return results.map(({ vector, ...result }) => {
+                    // Replace the collection-local RRF score with a globally
+                    // comparable one. Non-hybrid collections already return
+                    // cosine scores. A candidate with no stored vector keeps
+                    // its RRF score and sinks below every cosine-scored result
+                    // — acceptable degradation for a broken/legacy collection.
+                    let score = result.score;
+                    if (isHybrid) {
+                        if (vector && vector.length === precomputedEmbedding.vector.length) {
+                            score = Context.cosineSimilarity(precomputedEmbedding.vector, vector);
+                        } else {
+                            unscorableCandidates++;
+                        }
+                    }
+                    return { ...result, score, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath };
+                });
             } catch (error) {
                 console.warn(`[Context] ⚠️  Skipping collection '${r.collectionName}' in org-wide search (likely an embedding-dimension or hybrid-mode mismatch with this searcher's provider): ${error}`);
                 return [];
             }
         });
 
+        if (unscorableCandidates > 0) {
+            console.warn(`[Context] ⚠️  ${unscorableCandidates} org-wide candidates had no stored vector to re-rank by; they keep their per-collection RRF score and rank last.`);
+        }
         const merged = perCollectionResults.flat().sort((a, b) => b.score - a.score);
         console.log(`[Context] ✅ Org-wide search found ${merged.length} results across ${repos.length} collections, returning top ${Math.min(topK, merged.length)}`);
         return merged.slice(0, topK);
+    }
+
+    /**
+     * Cosine similarity between two equal-length vectors. Embeddings are not
+     * assumed normalized. Returns 0 when either vector has zero magnitude.
+     */
+    private static cosineSimilarity(a: number[], b: number[]): number {
+        let dot = 0;
+        let normA = 0;
+        let normB = 0;
+        for (let i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            normA += a[i] * a[i];
+            normB += b[i] * b[i];
+        }
+        if (normA === 0 || normB === 0) return 0;
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
     /**
@@ -717,7 +761,7 @@ export class Context {
         return results;
     }
 
-    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector; skipProbeQuery?: boolean }): Promise<SemanticSearchResult[]> {
+    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector; skipProbeQuery?: boolean; includeVector?: boolean }): Promise<SemanticSearchResult[]> {
         const isHybrid = options?.isHybrid ?? this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}"`);
@@ -778,7 +822,8 @@ export class Context {
                         params: { k: 100 }
                     },
                     limit: topK,
-                    filterExpr
+                    filterExpr,
+                    includeVector: options?.includeVector
                 }
             );
 
@@ -791,7 +836,8 @@ export class Context {
                 startLine: result.document.startLine,
                 endLine: result.document.endLine,
                 language: result.document.metadata.language || 'unknown',
-                score: result.score
+                score: result.score,
+                ...(options?.includeVector ? { vector: result.document.vector } : {})
             }));
 
             const dedupedResults = this.deduplicateResults(results);

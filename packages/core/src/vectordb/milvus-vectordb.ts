@@ -679,7 +679,10 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 data: [search_param_1, search_param_2],
                 limit: options?.limit || searchRequests[0]?.limit || 10,
                 rerank: rerank_strategy,
-                output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+                output_fields: [
+                    'id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata',
+                    ...(options?.includeVector ? ['vector'] : []),
+                ],
             };
 
             if (options?.filterExpr && options.filterExpr.trim().length > 0) {
@@ -719,7 +722,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
                     document: {
                         id: result.id,
                         content: result.content,
-                        vector: [],
+                        vector: options?.includeVector ? (result.vector ?? []) : [],
                         sparse_vector: [],
                         relativePath: result.relativePath,
                         startLine: result.startLine,
