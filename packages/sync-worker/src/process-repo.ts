@@ -1,4 +1,4 @@
-import { Context, FileSynchronizer } from "@bigabid/claude-context-core";
+import { Context, EmbeddingModelMismatchError, FileSynchronizer } from "@bigabid/claude-context-core";
 import { SyncWorkerConfig } from "./config.js";
 import { createGithubAppAuth, mintInstallationToken, DiscoveredRepo } from "./github-app.js";
 import { cloneOrPull, EmptyRepoError } from "./git-sync.js";
@@ -39,6 +39,42 @@ export async function runFirstIndex(context: Context, repoPath: string, repoFull
     const stats = await context.indexCodebase(repoPath);
     await synchronizer.persistSnapshot();
     console.log(`[SYNC] [${repoFullName}] done: indexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks`);
+}
+
+/**
+ * Incremental sync for an already-indexed repo, with the recovery path for an
+ * intentional embedding-model change: core's reindexByChange refuses (typed
+ * EmbeddingModelMismatchError) to write vectors from a different model into a
+ * tagged collection. Without a recovery path that repo would fail every run
+ * forever, since descriptions are immutable and only a force re-index (drop +
+ * recreate) can move a collection to the new model. That rebuild re-embeds the
+ * whole repo, so it's destructive and costs real embedding traffic — it only
+ * runs when the operator opts in via SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH.
+ */
+export async function runIncrementalSync(context: Context, repoPath: string, repoFullName: string, forceReindexOnModelMismatch: boolean): Promise<void> {
+    console.log(`[SYNC] [${repoFullName}] reindexing (path: ${repoPath})...`);
+    try {
+        const stats = await context.reindexByChange(repoPath);
+        console.log(`[SYNC] [${repoFullName}] done: +${stats.added} -${stats.removed} ~${stats.modified}`);
+    } catch (error) {
+        if (!(error instanceof EmbeddingModelMismatchError)) {
+            throw error;
+        }
+        if (!forceReindexOnModelMismatch) {
+            throw new EmbeddingModelMismatchError(
+                `${error.message} Set SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH=true on the sync-worker to rebuild affected collections with the current model.`
+            );
+        }
+        console.warn(`[SYNC] [${repoFullName}] embedding model changed (${error.message}) - SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH is set, rebuilding the collection with the current model...`);
+        // Delete the old model's snapshot BEFORE rebuilding: runFirstIndex
+        // drops/recreates the collection (now tagged with the new model), so
+        // if indexing then crashes partway, a surviving stale snapshot would
+        // send the next run down the incremental branch — zero changes against
+        // an empty collection, reported healthy forever. With the snapshot
+        // gone, a crashed rebuild lands in the full-rebuild branch and retries.
+        await FileSynchronizer.deleteSnapshot(repoPath);
+        await runFirstIndex(context, repoPath, repoFullName, true);
+    }
 }
 
 export async function processRepo(context: Context, appAuth: AppAuth, config: SyncWorkerConfig, repo: DiscoveredRepo): Promise<void> {
@@ -85,8 +121,6 @@ export async function processRepo(context: Context, appAuth: AppAuth, config: Sy
         // reading the snapshot file this just wrote) diffs correctly.
         await runFirstIndex(context, repoPath, repo.fullName, alreadyIndexed);
     } else {
-        console.log(`[SYNC] [${repo.fullName}] reindexing (path: ${repoPath})...`);
-        const stats = await context.reindexByChange(repoPath);
-        console.log(`[SYNC] [${repo.fullName}] done: +${stats.added} -${stats.removed} ~${stats.modified}`);
+        await runIncrementalSync(context, repoPath, repo.fullName, config.forceReindexOnModelMismatch);
     }
 }

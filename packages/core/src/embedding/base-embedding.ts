@@ -73,4 +73,15 @@ export abstract class Embedding {
      * @returns Provider name
      */
     abstract getProvider(): string;
-} 
+
+    /**
+     * Effective model name (the configured model, or the provider's default).
+     * Recorded as `provider/model` in each collection's description at index
+     * time so org-wide search can refuse to cosine-compare vectors from a
+     * different embedding space — equal dimensions do NOT imply the same
+     * model. Providers should override this.
+     */
+    getModel(): string {
+        return 'unknown';
+    }
+}

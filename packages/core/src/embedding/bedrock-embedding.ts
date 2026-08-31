@@ -175,6 +175,10 @@ export class BedrockEmbedding extends Embedding {
         return 'Bedrock';
     }
 
+    getModel(): string {
+        return this.config.model || 'amazon.titan-embed-text-v2:0';
+    }
+
     /**
      * Set model type
      * @param model Bedrock model ID

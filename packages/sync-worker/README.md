@@ -34,6 +34,19 @@ Plus the same embedding-provider and Milvus variables as `@bigabid/claude-contex
 | `SYNC_INCLUDE_FORKS` | Set `true` to index forks too | `false` |
 | `SYNC_REPOS_DIR` | Local checkout directory (should be a persistent volume, so repeated runs are incremental rather than re-cloning everything) | `/data/repos` |
 | `SYNC_CONCURRENCY` | How many repos to clone/index at once | `4` |
+| `SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH` | Set `true` to rebuild (drop + full re-index) any collection recorded with a different embedding model than the current one. See "Changing the embedding model" below | `false` |
+
+## Changing the embedding model
+
+Each collection records the `provider/model` that indexed it in its Milvus description, and core refuses to write vectors from a different model into it (mixing embedding spaces silently corrupts search). Because Milvus descriptions are immutable, the only way to move a collection to a new model is to drop and rebuild it.
+
+So after changing `EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` on this worker, every already-tagged collection will fail its sync with `EmbeddingModelMismatchError` on every run. To migrate:
+
+1. Set `SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH=true` alongside the new model config.
+2. Let one full run complete — each mismatched collection is dropped and fully re-embedded with the new model (this is the expensive part: the whole org's embedding traffic in one run).
+3. Remove the flag. Leaving it on permanently is dangerous: an accidental model/env drift would silently rebuild collections instead of failing loudly.
+
+Collections created before model tagging existed carry no tag and are assumed to match; they migrate to tagged descriptions whenever they're next force-rebuilt.
 
 ## Creating the GitHub App
 
