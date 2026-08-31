@@ -686,8 +686,7 @@ export class Context {
         console.log(`[Context] 🔍 Org-wide search across ${repos.length} collections: "${query}"`);
         const precomputedEmbedding = await this.embedding.embed(query);
 
-        let unscorableCandidates = 0;
-        const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<OrgSearchResult[]> => {
+        const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<Array<{ result: OrgSearchResult; scorable: boolean }>> => {
             const isHybrid = r.collectionName.startsWith('hybrid_code_chunks_');
             try {
                 const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: isHybrid });
@@ -695,17 +694,20 @@ export class Context {
                     // Replace the collection-local RRF score with a globally
                     // comparable one. Non-hybrid collections already return
                     // cosine scores. A candidate with no stored vector keeps
-                    // its RRF score and sinks below every cosine-scored result
-                    // — acceptable degradation for a broken/legacy collection.
+                    // its RRF score for display but is ranked in a trailing
+                    // bucket below every cosine-scored result (a cosine can be
+                    // lower than the RRF score, even negative) — acceptable
+                    // degradation for a broken/legacy collection.
                     let score = result.score;
+                    let scorable = true;
                     if (isHybrid) {
                         if (vector && vector.length === precomputedEmbedding.vector.length) {
                             score = Context.cosineSimilarity(precomputedEmbedding.vector, vector);
                         } else {
-                            unscorableCandidates++;
+                            scorable = false;
                         }
                     }
-                    return { ...result, score, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath };
+                    return { result: { ...result, score, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath }, scorable };
                 });
             } catch (error) {
                 console.warn(`[Context] ⚠️  Skipping collection '${r.collectionName}' in org-wide search (likely an embedding-dimension or hybrid-mode mismatch with this searcher's provider): ${error}`);
@@ -713,10 +715,14 @@ export class Context {
             }
         });
 
-        if (unscorableCandidates > 0) {
-            console.warn(`[Context] ⚠️  ${unscorableCandidates} org-wide candidates had no stored vector to re-rank by; they keep their per-collection RRF score and rank last.`);
+        const candidates = perCollectionResults.flat();
+        const byScoreDesc = (a: OrgSearchResult, b: OrgSearchResult) => b.score - a.score;
+        const scored = candidates.filter((c) => c.scorable).map((c) => c.result).sort(byScoreDesc);
+        const unscorable = candidates.filter((c) => !c.scorable).map((c) => c.result).sort(byScoreDesc);
+        if (unscorable.length > 0) {
+            console.warn(`[Context] ⚠️  ${unscorable.length} org-wide candidates had no stored vector to re-rank by; they keep their per-collection RRF score and rank after all similarity-scored results.`);
         }
-        const merged = perCollectionResults.flat().sort((a, b) => b.score - a.score);
+        const merged = [...scored, ...unscorable];
         console.log(`[Context] ✅ Org-wide search found ${merged.length} results across ${repos.length} collections, returning top ${Math.min(topK, merged.length)}`);
         return merged.slice(0, topK);
     }

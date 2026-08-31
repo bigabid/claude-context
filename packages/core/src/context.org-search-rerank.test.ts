@@ -118,7 +118,7 @@ describe('semanticSearchAllRepos cross-collection ranking', () => {
         );
     });
 
-    test('a hybrid candidate with no stored vector keeps its RRF score and sinks below cosine-scored results', async () => {
+    test('a hybrid candidate with no stored vector ranks below every cosine-scored result, even a negative one', async () => {
         const vectorDatabase = createVectorDatabase();
         vectorDatabase.listCollections.mockResolvedValue([
             'hybrid_code_chunks_aaaaaaaa',
@@ -133,8 +133,10 @@ describe('semanticSearchAllRepos cross-collection ranking', () => {
                 // Vector missing (e.g. legacy collection) — cannot be re-scored.
                 return [{ document: { ...chunk('a-1', 'legacy.ts', []), vector: [] }, score: RRF_TOP_SCORE }];
             }
-            // Weak but real cosine match (~0.0995) still beats an un-rescorable RRF score (~0.0198).
-            return [{ document: chunk('b-1', 'weak.ts', [0.1, 1, 0]), score: RRF_TOP_SCORE }];
+            // A terrible but real cosine match (-1, below the RRF score) must
+            // still outrank an un-rescorable candidate: a verified similarity —
+            // however low — is more information than no similarity at all.
+            return [{ document: chunk('b-1', 'weak.ts', [-1, 0, 0]), score: RRF_TOP_SCORE }];
         });
         const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
 
@@ -142,6 +144,8 @@ describe('semanticSearchAllRepos cross-collection ranking', () => {
 
         expect(results).toHaveLength(2);
         expect(results[0].relativePath).toBe('weak.ts');
+        expect(results[0].score).toBeCloseTo(-1, 5);
+        // The unscorable candidate keeps its RRF score for display but ranks last.
         expect(results[1].relativePath).toBe('legacy.ts');
         expect(results[1].score).toBeCloseTo(RRF_TOP_SCORE, 5);
     });
