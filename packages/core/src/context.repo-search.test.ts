@@ -1,7 +1,7 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { Context } from './context';
+import { Context, EmbeddingModelMismatchError } from './context';
 import { Embedding, EmbeddingVector } from './embedding';
 import { FileSynchronizer } from './sync/synchronizer';
 import { VectorDatabase } from './vectordb';
@@ -255,6 +255,7 @@ describe('Context repo-identity search (no local checkout required)', () => {
         );
         const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
 
+        await expect(context.getPreparedCollection(checkout)).rejects.toBeInstanceOf(EmbeddingModelMismatchError);
         await expect(context.getPreparedCollection(checkout)).rejects.toThrow(/embedding model/i);
         // Same collection with a matching tag (or no tag) is reusable.
         vectorDatabase.getCollectionDescription.mockResolvedValue(
@@ -288,7 +289,7 @@ describe('Context repo-identity search (no local checkout required)', () => {
         );
         await fs.writeFile(path.join(checkout, 'b.ts'), 'export const b = 2;\n', 'utf-8');
 
-        await expect(context.reindexByChange(checkout)).rejects.toThrow(/embedding model/i);
+        await expect(context.reindexByChange(checkout)).rejects.toBeInstanceOf(EmbeddingModelMismatchError);
         expect(vectorDatabase.insertHybrid).not.toHaveBeenCalledWith(
             expect.any(String),
             expect.arrayContaining([expect.objectContaining({ relativePath: 'b.ts' })])

@@ -53,6 +53,20 @@ export class EmbeddingError extends Error {
     }
 }
 
+/**
+ * Thrown when an index/reindex would write vectors from one embedding model
+ * into a collection recorded as belonging to another (see
+ * `ensureCollectionModelMatches`). Typed so operational callers (e.g. the
+ * sync-worker) can distinguish "operator changed the embedding model" — which
+ * has a deliberate recovery path, force reindex — from a real failure.
+ */
+export class EmbeddingModelMismatchError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'EmbeddingModelMismatchError';
+    }
+}
+
 // Cap on concurrent Milvus round trips during semanticSearchAllRepos's
 // fan-out. Without a bound, an org with hundreds of indexed collections
 // opens that many concurrent requests per search_org call.
@@ -775,7 +789,7 @@ export class Context {
         }
         const current = this.getEmbeddingModelIdentity();
         if (recorded !== undefined && recorded !== current) {
-            throw new Error(
+            throw new EmbeddingModelMismatchError(
                 `Collection '${collectionName}' was indexed with embedding model '${recorded}', but this indexer is configured with '${current}'. ` +
                 `Refusing to mix vector spaces — force a full reindex to rebuild the collection with the current model.`
             );

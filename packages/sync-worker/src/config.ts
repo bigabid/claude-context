@@ -19,6 +19,12 @@ export interface SyncWorkerConfig {
     // How many repos to process concurrently
     concurrency: number;
 
+    // Opt-in recovery after an intentional embedding-model change: rebuild
+    // (drop + full re-index) any collection whose recorded model differs from
+    // the current one, instead of failing that repo every run. Destructive
+    // and re-embeds whole repos - leave off in normal operation.
+    forceReindexOnModelMismatch: boolean;
+
     // Embedding provider (mirrors packages/mcp/src/config.ts's shape)
     embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'Bedrock';
     embeddingModel: string;
@@ -115,6 +121,7 @@ export function loadConfig(): SyncWorkerConfig {
 
         reposDir: envManager.get('SYNC_REPOS_DIR') || '/data/repos',
         concurrency: getPositiveIntegerFromEnv('SYNC_CONCURRENCY') || 4,
+        forceReindexOnModelMismatch: (envManager.get('SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH') || '').toLowerCase() === 'true',
 
         embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as SyncWorkerConfig['embeddingProvider']) || 'OpenAI',
         embeddingModel: envManager.get('EMBEDDING_MODEL') || '',
