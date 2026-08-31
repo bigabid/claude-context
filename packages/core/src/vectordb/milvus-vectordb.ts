@@ -751,6 +751,15 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
         });
 
+        // The gRPC SDK reports failures via status, not by throwing. Callers
+        // like the embedding-model guard rely on "couldn't read" being an
+        // error rather than an empty description — an empty string means
+        // "legacy collection, no metadata recorded", which a rate limit or
+        // partial outage must never be mistaken for.
+        if (result.status.error_code !== 'Success') {
+            throw new Error(`Failed to describe collection '${collectionName}': ${result.status.reason}`);
+        }
+
         return (result as any).schema?.description || '';
     }
 

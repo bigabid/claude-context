@@ -771,7 +771,20 @@ export class Context {
      * search. Both sides are built by this method, so the comparison is exact.
      */
     private getEmbeddingModelIdentity(): string {
-        return `${this.embedding.getProvider()}/${this.embedding.getModel()}`;
+        const identity = `${this.embedding.getProvider()}/${this.embedding.getModel()}`;
+        // The identity is written verbatim into the ';'-delimited collection
+        // description, and EMBEDDING_MODEL is a free-form env var. A ';' (or
+        // newline) would truncate the recorded tag, making this very indexer
+        // see a permanent mismatch against itself — with the sync-worker's
+        // recovery flag on, that means re-embedding every collection on every
+        // run. Refuse loudly instead.
+        if (/[;\r\n]/.test(identity)) {
+            throw new Error(
+                `Invalid embedding model identity '${identity.replace(/[\r\n]/g, '\\n')}': it must not contain ';' or newlines. ` +
+                `Check the EMBEDDING_MODEL / EMBEDDING_PROVIDER configuration for copy-paste artifacts.`
+            );
+        }
+        return identity;
     }
 
     /**

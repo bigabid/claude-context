@@ -301,6 +301,26 @@ describe('Context repo-identity search (no local checkout required)', () => {
         );
     });
 
+    test('an embedding model containing the description delimiter is rejected instead of corrupting the tag', async () => {
+        // EMBEDDING_MODEL is a free-form env var. Written verbatim into the
+        // ';'-delimited description, a ';' would truncate the recorded tag so
+        // this very indexer sees a permanent mismatch against itself — and
+        // with the sync-worker's recovery flag on, that means dropping and
+        // fully re-embedding every collection on every run.
+        class DelimiterModelEmbedding extends TestEmbedding {
+            getModel(): string {
+                return 'voyage-code-3;';
+            }
+        }
+        const checkout = path.join(tempRoot, 'checkout-bad-model');
+        await fs.mkdir(checkout, { recursive: true });
+        await writeGitOriginConfig(checkout, 'https://github.com/bigabid/core-mwaa.git');
+
+        const context = new Context({ vectorDatabase: createVectorDatabase(), embedding: new DelimiterModelEmbedding() });
+
+        await expect(context.getPreparedCollection(checkout)).rejects.toThrow(/embedding model identity/i);
+    });
+
     test('the embedding-model guard fails closed when the collection description cannot be read', async () => {
         const checkout = path.join(tempRoot, 'checkout-describe-error');
         await fs.mkdir(checkout, { recursive: true });
