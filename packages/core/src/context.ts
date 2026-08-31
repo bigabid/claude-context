@@ -690,13 +690,23 @@ export class Context {
         const byRankOrder = (a: RankedCandidate, b: RankedCandidate) =>
             (Number(b.scorable) - Number(a.scorable)) || (b.score - a.score);
 
+        const searcherModel = this.getEmbeddingModelIdentity();
         const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<RankedCandidate[]> => {
             const isHybrid = r.collectionName.startsWith('hybrid_code_chunks_');
+            // A collection recorded with a DIFFERENT embedding model lives in a
+            // foreign vector space: its cosines against our query embedding are
+            // meaningless even when the dimensions happen to match, so its
+            // candidates go to the unscorable trailing bucket. Collections with
+            // no recorded model (indexed before tagging existed) are assumed to
+            // match — the deployment has one shared model, and treating them as
+            // mismatched would demote every legacy collection.
+            const modelMismatch = r.embeddingModel !== undefined && r.embeddingModel !== searcherModel;
+            const rescorable = isHybrid && !modelMismatch;
             try {
                 // Hybrid collections skip in-collection dedup: dedup keeps the
                 // first-seen of two overlapping chunks, and on RRF order that
                 // can be the lower-cosine one. We dedup below, after re-scoring.
-                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: isHybrid, skipDedup: isHybrid });
+                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: rescorable, skipDedup: rescorable });
                 const candidates = results.map(({ vector, ...result }): RankedCandidate => {
                     // Replace the collection-local RRF score with a globally
                     // comparable one. Non-hybrid collections already return
@@ -706,8 +716,8 @@ export class Context {
                     // lower than the RRF score, even negative) — acceptable
                     // degradation for a broken/legacy collection.
                     let score = result.score;
-                    let scorable = true;
-                    if (isHybrid) {
+                    let scorable = !modelMismatch;
+                    if (rescorable) {
                         if (vector && vector.length === precomputedEmbedding.vector.length) {
                             score = Context.cosineSimilarity(precomputedEmbedding.vector, vector);
                         } else {
@@ -726,11 +736,20 @@ export class Context {
         const candidates = perCollectionResults.flat().sort(byRankOrder);
         const unscorableCount = candidates.filter((c) => !c.scorable).length;
         if (unscorableCount > 0) {
-            console.warn(`[Context] ⚠️  ${unscorableCount} org-wide candidates had no stored vector to re-rank by; they keep their per-collection RRF score and rank after all similarity-scored results.`);
+            console.warn(`[Context] ⚠️  ${unscorableCount} org-wide candidates could not be similarity-ranked (no stored vector, or indexed with a different embedding model); they keep their per-collection score and rank after all similarity-scored results.`);
         }
         const merged = candidates.map(({ scorable, ...result }) => result);
         console.log(`[Context] ✅ Org-wide search found ${merged.length} results across ${repos.length} collections, returning top ${Math.min(topK, merged.length)}`);
         return merged.slice(0, topK);
+    }
+
+    /**
+     * `provider/model` identity of this Context's embedding, as recorded in
+     * collection descriptions at index time and compared during org-wide
+     * search. Both sides are built by this method, so the comparison is exact.
+     */
+    private getEmbeddingModelIdentity(): string {
+        return `${this.embedding.getProvider()}/${this.embedding.getModel()}`;
     }
 
     /**
@@ -942,31 +961,35 @@ export class Context {
      * what's searchable without already knowing a repo name or having any
      * local checkout — pair with `semanticSearchByRepo`.
      *
-     * Collections indexed before this field existed only have `codebasePath`
-     * in their description (no `repo` identity) and are reported as such.
+     * Collections indexed before these fields existed only have `codebasePath`
+     * in their description (no `repo` identity, no `embeddingModel`) and are
+     * reported as such.
      */
-    async listIndexedRepos(): Promise<Array<{ collectionName: string; repo?: string; codebasePath?: string }>> {
+    async listIndexedRepos(): Promise<Array<{ collectionName: string; repo?: string; embeddingModel?: string; codebasePath?: string }>> {
         const allCollections = await this.vectorDatabase.listCollections();
         const codeCollections = allCollections.filter(
             (name) => name.startsWith('code_chunks_') || name.startsWith('hybrid_code_chunks_')
         );
 
-        const results: Array<{ collectionName: string; repo?: string; codebasePath?: string }> = [];
+        const results: Array<{ collectionName: string; repo?: string; embeddingModel?: string; codebasePath?: string }> = [];
         for (const collectionName of codeCollections) {
             let repo: string | undefined;
+            let embeddingModel: string | undefined;
             let codebasePath: string | undefined;
             try {
                 const description = await this.vectorDatabase.getCollectionDescription(collectionName);
                 // codebasePath is always the last field (see prepareCollection), so it's
                 // matched greedily to end-of-string — safe even if the path itself contains ';'.
                 const repoMatch = description.match(/(?:^|;)repo:([^;]*)/);
+                const modelMatch = description.match(/(?:^|;)embeddingModel:([^;]*)/);
                 const pathMatch = description.match(/(?:^|;)codebasePath:(.*)$/);
                 repo = repoMatch?.[1]?.trim() || undefined;
+                embeddingModel = modelMatch?.[1]?.trim() || undefined;
                 codebasePath = pathMatch?.[1]?.trim() || undefined;
             } catch (error) {
                 console.warn(`[Context] ⚠️ Failed to read description for collection '${collectionName}': ${error}`);
             }
-            results.push({ collectionName, repo, codebasePath });
+            results.push({ collectionName, repo, embeddingModel, codebasePath });
         }
         return results;
     }
@@ -1092,15 +1115,19 @@ export class Context {
         // Record the repo identity alongside the local path when available, so
         // listIndexedRepos() can report a stable, human-recognizable name for
         // this collection regardless of who indexed it or what folder they used.
-        // `repo` (normalized, never contains ';' or newlines) goes FIRST and
-        // `codebasePath` (an arbitrary, unescaped local path) goes LAST, since
-        // paths on Linux/Mac can legally contain ';' — parsing codebasePath
-        // greedily to end-of-string means an embedded ';' can never truncate
-        // it or get misread as the start of a later field.
+        // Also record the embedding provider/model, so org-wide search can
+        // refuse to cosine-compare vectors indexed with a different model that
+        // happens to share this one's dimension (same dimension ≠ same space).
+        // `repo` and `embeddingModel` (normalized, never contain ';' or
+        // newlines) go FIRST and `codebasePath` (an arbitrary, unescaped local
+        // path) goes LAST, since paths on Linux/Mac can legally contain ';' —
+        // parsing codebasePath greedily to end-of-string means an embedded ';'
+        // can never truncate it or get misread as the start of a later field.
         const remoteIdentity = this.getGitRemoteIdentity(codebasePath);
+        const embeddingModel = this.getEmbeddingModelIdentity();
         const description = remoteIdentity
-            ? `repo:${remoteIdentity};codebasePath:${codebasePath}`
-            : `codebasePath:${codebasePath}`;
+            ? `repo:${remoteIdentity};embeddingModel:${embeddingModel};codebasePath:${codebasePath}`
+            : `embeddingModel:${embeddingModel};codebasePath:${codebasePath}`;
 
         if (isHybrid === true) {
             await this.vectorDatabase.createHybridCollection(collectionName, dimension, description);

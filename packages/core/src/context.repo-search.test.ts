@@ -29,6 +29,10 @@ class TestEmbedding extends Embedding {
     getProvider(): string {
         return 'test';
     }
+
+    getModel(): string {
+        return 'test-embed-1';
+    }
 }
 
 const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
@@ -200,6 +204,41 @@ describe('Context repo-identity search (no local checkout required)', () => {
             collectionName: 'hybrid_code_chunks_bbbbbbbb',
             repo: undefined,
             codebasePath: 'C:\\Users\\alex\\rtb-engine'
+        });
+    });
+
+    test('prepareCollection records the embedding model in the description, with codebasePath still last', async () => {
+        const checkout = path.join(tempRoot, 'checkout');
+        await fs.mkdir(checkout, { recursive: true });
+        await writeGitOriginConfig(checkout, 'https://github.com/bigabid/core-mwaa.git');
+
+        const vectorDatabase = createVectorDatabase();
+        const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
+
+        await context.getPreparedCollection(checkout);
+
+        expect(vectorDatabase.createCollection).toHaveBeenCalledWith(
+            expect.any(String),
+            3,
+            `repo:github.com/bigabid/core-mwaa;embeddingModel:test/test-embed-1;codebasePath:${checkout}`
+        );
+    });
+
+    test('listIndexedRepos parses the recorded embedding model out of collection descriptions', async () => {
+        const vectorDatabase = createVectorDatabase();
+        vectorDatabase.listCollections.mockResolvedValue(['code_chunks_eeeeeeee']);
+        vectorDatabase.getCollectionDescription.mockResolvedValue(
+            'repo:github.com/bigabid/core-mwaa;embeddingModel:openai/text-embedding-3-small;codebasePath:/home/itai/workspace/core-mwaa'
+        );
+        const context = new Context({ vectorDatabase });
+
+        const repos = await context.listIndexedRepos();
+
+        expect(repos).toContainEqual({
+            collectionName: 'code_chunks_eeeeeeee',
+            repo: 'github.com/bigabid/core-mwaa',
+            embeddingModel: 'openai/text-embedding-3-small',
+            codebasePath: '/home/itai/workspace/core-mwaa'
         });
     });
 

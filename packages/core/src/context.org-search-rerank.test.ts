@@ -24,6 +24,10 @@ class TestEmbedding extends Embedding {
     getProvider(): string {
         return 'test';
     }
+
+    getModel(): string {
+        return 'test-embed-1';
+    }
 }
 
 const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
@@ -153,6 +157,45 @@ describe('semanticSearchAllRepos cross-collection ranking', () => {
         expect(results[0].score).toBeCloseTo(0.8, 5);
         expect(results[1].relativePath).toBe('other.ts');
         expect(results[1].score).toBeCloseTo(0.7, 5);
+    });
+
+    test('a collection recorded with a DIFFERENT embedding model is never cosine-ranked, even at the same dimension', async () => {
+        // Same dimension does not mean same vector space: a collection indexed
+        // with another model produces plausible-looking but meaningless cosines.
+        // A collection whose description records a mismatched model must go to
+        // the unscorable trailing bucket; one with NO recorded model (legacy,
+        // pre-tagging) keeps the status-quo cosine ranking.
+        const vectorDatabase = createVectorDatabase();
+        vectorDatabase.listCollections.mockResolvedValue([
+            'hybrid_code_chunks_aaaaaaaa',
+            'hybrid_code_chunks_bbbbbbbb',
+        ]);
+        vectorDatabase.getCollectionDescription.mockImplementation(async (name: string) => {
+            if (name === 'hybrid_code_chunks_aaaaaaaa') {
+                // Recorded with a different model than the searcher's test/test-embed-1.
+                return 'repo:github.com/bigabid/foreign;embeddingModel:openai/text-embedding-ada-002;codebasePath:/home/x/foreign';
+            }
+            // Legacy description, no model recorded.
+            return 'repo:github.com/bigabid/legacy;codebasePath:/home/x/legacy';
+        });
+        vectorDatabase.hybridSearch.mockImplementation(async (collectionName: string) => {
+            if (collectionName === 'hybrid_code_chunks_aaaaaaaa') {
+                // In its foreign space this chunk would cosine-score a perfect 1.
+                return [{ document: chunk('f-1', 'foreign.ts', [1, 0, 0]), score: RRF_TOP_SCORE }];
+            }
+            // Weak but honestly-scored match (~0.0995).
+            return [{ document: chunk('l-1', 'legacy.ts', [0.1, 1, 0]), score: RRF_TOP_SCORE }];
+        });
+        const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
+
+        const results = await context.semanticSearchAllRepos('anything');
+
+        expect(results).toHaveLength(2);
+        expect(results[0].relativePath).toBe('legacy.ts');
+        expect(results[0].score).toBeCloseTo(0.0995, 3);
+        // The foreign-model chunk keeps its RRF score and ranks last.
+        expect(results[1].relativePath).toBe('foreign.ts');
+        expect(results[1].score).toBeCloseTo(RRF_TOP_SCORE, 5);
     });
 
     test('a hybrid candidate with no stored vector ranks below every cosine-scored result, even a negative one', async () => {
