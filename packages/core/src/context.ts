@@ -571,6 +571,11 @@ export class Context {
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
 
+        // About to write vectors produced by THIS embedding model — refuse if
+        // the collection is recorded as belonging to a different one, or the
+        // collection would silently become a mix of incompatible vector spaces.
+        await this.ensureCollectionModelMatches(collectionName);
+
         let processedChanges = 0;
         const updateProgress = (phase: string) => {
             processedChanges++;
@@ -750,6 +755,31 @@ export class Context {
      */
     private getEmbeddingModelIdentity(): string {
         return `${this.embedding.getProvider()}/${this.embedding.getModel()}`;
+    }
+
+    /**
+     * Refuse to write into an existing collection whose recorded embedding
+     * model differs from this Context's — Milvus descriptions are immutable,
+     * so indexing on would produce a collection whose vectors and tag disagree
+     * (or a silent mix of incompatible vector spaces). Collections with no
+     * recorded model (created before tagging existed) are assumed to match.
+     */
+    private async ensureCollectionModelMatches(collectionName: string): Promise<void> {
+        let recorded: string | undefined;
+        try {
+            const description = await this.vectorDatabase.getCollectionDescription(collectionName);
+            recorded = description.match(/(?:^|;)embeddingModel:([^;]*)/)?.[1]?.trim() || undefined;
+        } catch (error) {
+            console.warn(`[Context] ⚠️ Failed to read description for collection '${collectionName}' while checking its embedding model: ${error}`);
+            return;
+        }
+        const current = this.getEmbeddingModelIdentity();
+        if (recorded !== undefined && recorded !== current) {
+            throw new Error(
+                `Collection '${collectionName}' was indexed with embedding model '${recorded}', but this indexer is configured with '${current}'. ` +
+                `Refusing to mix vector spaces — force a full reindex to rebuild the collection with the current model.`
+            );
+        }
     }
 
     /**
@@ -1098,6 +1128,7 @@ export class Context {
         const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
 
         if (collectionExists && !forceReindex) {
+            await this.ensureCollectionModelMatches(collectionName);
             console.log(`📋 Collection ${collectionName} already exists, skipping creation`);
             return;
         }

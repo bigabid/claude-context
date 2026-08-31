@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Context } from './context';
 import { Embedding, EmbeddingVector } from './embedding';
+import { FileSynchronizer } from './sync/synchronizer';
 import { VectorDatabase } from './vectordb';
 
 class TestEmbedding extends Embedding {
@@ -240,6 +241,58 @@ describe('Context repo-identity search (no local checkout required)', () => {
             embeddingModel: 'openai/text-embedding-3-small',
             codebasePath: '/home/itai/workspace/core-mwaa'
         });
+    });
+
+    test('prepareCollection refuses to reuse an existing collection recorded with a different embedding model', async () => {
+        const checkout = path.join(tempRoot, 'checkout-mismatch');
+        await fs.mkdir(checkout, { recursive: true });
+        await writeGitOriginConfig(checkout, 'https://github.com/bigabid/core-mwaa.git');
+
+        const vectorDatabase = createVectorDatabase();
+        vectorDatabase.hasCollection.mockResolvedValue(true);
+        vectorDatabase.getCollectionDescription.mockResolvedValue(
+            'repo:github.com/bigabid/core-mwaa;embeddingModel:openai/text-embedding-ada-002;codebasePath:/home/x/core-mwaa'
+        );
+        const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
+
+        await expect(context.getPreparedCollection(checkout)).rejects.toThrow(/embedding model/i);
+        // Same collection with a matching tag (or no tag) is reusable.
+        vectorDatabase.getCollectionDescription.mockResolvedValue(
+            'repo:github.com/bigabid/core-mwaa;embeddingModel:test/test-embed-1;codebasePath:/home/x/core-mwaa'
+        );
+        await expect(context.getPreparedCollection(checkout)).resolves.toBeUndefined();
+        vectorDatabase.getCollectionDescription.mockResolvedValue(
+            'repo:github.com/bigabid/core-mwaa;codebasePath:/home/x/core-mwaa'
+        );
+        await expect(context.getPreparedCollection(checkout)).resolves.toBeUndefined();
+    });
+
+    test('reindexByChange refuses to write into a collection recorded with a different embedding model', async () => {
+        const checkout = path.join(tempRoot, 'checkout-reindex');
+        await fs.mkdir(checkout, { recursive: true });
+        await writeGitOriginConfig(checkout, 'https://github.com/bigabid/reindex-guard.git');
+        await fs.writeFile(path.join(checkout, 'a.ts'), 'export const a = 1;\n', 'utf-8');
+
+        const vectorDatabase = createVectorDatabase();
+        const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
+        await context.indexCodebase(checkout);
+        // Register the synchronizer the way real callers (mcp handlers, the
+        // sync-worker) do — reindexByChange diffs against its snapshot.
+        const synchronizer = new FileSynchronizer(checkout, [], ['.ts']);
+        await synchronizer.initialize();
+        context.setSynchronizer(context.getCollectionName(checkout), synchronizer);
+
+        // The collection was created by someone else with a different model.
+        vectorDatabase.getCollectionDescription.mockResolvedValue(
+            'repo:github.com/bigabid/reindex-guard;embeddingModel:openai/text-embedding-ada-002;codebasePath:/home/x/reindex-guard'
+        );
+        await fs.writeFile(path.join(checkout, 'b.ts'), 'export const b = 2;\n', 'utf-8');
+
+        await expect(context.reindexByChange(checkout)).rejects.toThrow(/embedding model/i);
+        expect(vectorDatabase.insertHybrid).not.toHaveBeenCalledWith(
+            expect.any(String),
+            expect.arrayContaining([expect.objectContaining({ relativePath: 'b.ts' })])
+        );
     });
 
     test('listIndexedRepos survives a codebasePath containing a literal semicolon (legal on Linux/Mac)', async () => {
