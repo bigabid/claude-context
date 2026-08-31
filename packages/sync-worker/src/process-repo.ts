@@ -66,6 +66,13 @@ export async function runIncrementalSync(context: Context, repoPath: string, rep
             );
         }
         console.warn(`[SYNC] [${repoFullName}] embedding model changed (${error.message}) - SYNC_FORCE_REINDEX_ON_MODEL_MISMATCH is set, rebuilding the collection with the current model...`);
+        // Delete the old model's snapshot BEFORE rebuilding: runFirstIndex
+        // drops/recreates the collection (now tagged with the new model), so
+        // if indexing then crashes partway, a surviving stale snapshot would
+        // send the next run down the incremental branch — zero changes against
+        // an empty collection, reported healthy forever. With the snapshot
+        // gone, a crashed rebuild lands in the full-rebuild branch and retries.
+        await FileSynchronizer.deleteSnapshot(repoPath);
         await runFirstIndex(context, repoPath, repoFullName, true);
     }
 }

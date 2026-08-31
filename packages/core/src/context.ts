@@ -573,6 +573,14 @@ export class Context {
 
         const currentSynchronizer = this.synchronizers.get(collectionName)!;
 
+        // The model guard MUST run before checkForChanges: checkForChanges
+        // persists the advanced merkle snapshot as soon as it detects changes,
+        // so throwing after it would fire exactly once — every later run would
+        // find "no changes" against the already-advanced snapshot and report
+        // the repo healthy forever while its updates never reached the vector
+        // DB. Costs one describeCollection per sync tick; correctness wins.
+        await this.ensureCollectionModelMatches(collectionName);
+
         progressCallback?.({ phase: 'Checking for file changes...', current: 0, total: 100, percentage: 0 });
         const { added, removed, modified } = await currentSynchronizer.checkForChanges();
         const totalChanges = added.length + removed.length + modified.length;
@@ -584,11 +592,6 @@ export class Context {
         }
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
-
-        // About to write vectors produced by THIS embedding model — refuse if
-        // the collection is recorded as belonging to a different one, or the
-        // collection would silently become a mix of incompatible vector spaces.
-        await this.ensureCollectionModelMatches(collectionName);
 
         let processedChanges = 0;
         const updateProgress = (phase: string) => {
@@ -779,14 +782,12 @@ export class Context {
      * recorded model (created before tagging existed) are assumed to match.
      */
     private async ensureCollectionModelMatches(collectionName: string): Promise<void> {
-        let recorded: string | undefined;
-        try {
-            const description = await this.vectorDatabase.getCollectionDescription(collectionName);
-            recorded = description.match(/(?:^|;)embeddingModel:([^;]*)/)?.[1]?.trim() || undefined;
-        } catch (error) {
-            console.warn(`[Context] ⚠️ Failed to read description for collection '${collectionName}' while checking its embedding model: ${error}`);
-            return;
-        }
+        // Fail closed: if the description can't be read, the model can't be
+        // verified, and proceeding could silently mix vector spaces — the
+        // exact corruption this guard exists to prevent. Callers treat the
+        // error as a per-run failure and retry next tick.
+        const description = await this.vectorDatabase.getCollectionDescription(collectionName);
+        const recorded = description.match(/(?:^|;)embeddingModel:([^;]*)/)?.[1]?.trim() || undefined;
         const current = this.getEmbeddingModelIdentity();
         if (recorded !== undefined && recorded !== current) {
             throw new EmbeddingModelMismatchError(

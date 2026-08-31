@@ -137,6 +137,38 @@ test("runIncrementalSync surfaces an embedding-model mismatch as a failure when 
     });
 });
 
+test("runIncrementalSync deletes the stale merkle snapshot before a model-mismatch rebuild, so a crashed rebuild retries", async () => {
+    await withTempHome(async (tempRoot) => {
+        const repoPath = path.join(tempRoot, "repo");
+        await fs.mkdir(repoPath, { recursive: true });
+        await fs.writeFile(path.join(repoPath, "a.ts"), "export const a = 1;\n");
+
+        // A snapshot from the OLD model's era exists on disk.
+        const oldSynchronizer = new FileSynchronizer(repoPath, [], ['.ts']);
+        await oldSynchronizer.initialize();
+        assert.equal(await FileSynchronizer.hasSnapshot(repoPath), true);
+
+        // Recovery drops/recreates the collection, then indexing crashes
+        // (quota, Milvus hiccup, pod killed). If the old snapshot survived,
+        // the next run would take the incremental branch, find zero changes
+        // against it, and report an EMPTY collection healthy forever.
+        const { context } = fakeReindexContext({
+            reindexError: new EmbeddingModelMismatchError("collection tagged openai/ada, indexer is voyage/code-3"),
+        });
+        (context as unknown as { indexCodebase: () => Promise<unknown> }).indexCodebase = async () => {
+            throw new Error("embedding quota exhausted");
+        };
+
+        await assert.rejects(() => runIncrementalSync(context, repoPath, "acme/widgets", true), /embedding quota exhausted/);
+
+        assert.equal(
+            await FileSynchronizer.hasSnapshot(repoPath),
+            false,
+            "the stale snapshot must be gone so the next run lands in the full-rebuild branch"
+        );
+    });
+});
+
 test("runIncrementalSync does not treat other reindex failures as model mismatches", async () => {
     await withTempHome(async (tempRoot) => {
         const repoPath = path.join(tempRoot, "repo");

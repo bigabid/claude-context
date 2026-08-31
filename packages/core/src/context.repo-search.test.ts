@@ -290,10 +290,30 @@ describe('Context repo-identity search (no local checkout required)', () => {
         await fs.writeFile(path.join(checkout, 'b.ts'), 'export const b = 2;\n', 'utf-8');
 
         await expect(context.reindexByChange(checkout)).rejects.toBeInstanceOf(EmbeddingModelMismatchError);
+        // The guard must fire BEFORE the synchronizer advances its merkle
+        // snapshot. If the snapshot is persisted first, the mismatch throws
+        // exactly once: every later run finds "no changes" and reports the
+        // repo healthy forever while b.ts never reached the vector DB.
+        await expect(context.reindexByChange(checkout)).rejects.toBeInstanceOf(EmbeddingModelMismatchError);
         expect(vectorDatabase.insertHybrid).not.toHaveBeenCalledWith(
             expect.any(String),
             expect.arrayContaining([expect.objectContaining({ relativePath: 'b.ts' })])
         );
+    });
+
+    test('the embedding-model guard fails closed when the collection description cannot be read', async () => {
+        const checkout = path.join(tempRoot, 'checkout-describe-error');
+        await fs.mkdir(checkout, { recursive: true });
+        await writeGitOriginConfig(checkout, 'https://github.com/bigabid/core-mwaa.git');
+
+        const vectorDatabase = createVectorDatabase();
+        vectorDatabase.hasCollection.mockResolvedValue(true);
+        vectorDatabase.getCollectionDescription.mockRejectedValue(new Error('milvus describe timeout'));
+        const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
+
+        // Proceeding unguarded could mix vector spaces silently; a transient
+        // describe failure must fail the run (callers retry next tick).
+        await expect(context.getPreparedCollection(checkout)).rejects.toThrow(/milvus describe timeout/);
     });
 
     test('listIndexedRepos survives a codebasePath containing a literal semicolon (legal on Linux/Mac)', async () => {
