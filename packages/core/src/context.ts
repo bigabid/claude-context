@@ -686,11 +686,18 @@ export class Context {
         console.log(`[Context] 🔍 Org-wide search across ${repos.length} collections: "${query}"`);
         const precomputedEmbedding = await this.embedding.embed(query);
 
-        const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<Array<{ result: OrgSearchResult; scorable: boolean }>> => {
+        type RankedCandidate = OrgSearchResult & { scorable: boolean };
+        const byRankOrder = (a: RankedCandidate, b: RankedCandidate) =>
+            (Number(b.scorable) - Number(a.scorable)) || (b.score - a.score);
+
+        const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<RankedCandidate[]> => {
             const isHybrid = r.collectionName.startsWith('hybrid_code_chunks_');
             try {
-                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: isHybrid });
-                return results.map(({ vector, ...result }) => {
+                // Hybrid collections skip in-collection dedup: dedup keeps the
+                // first-seen of two overlapping chunks, and on RRF order that
+                // can be the lower-cosine one. We dedup below, after re-scoring.
+                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: isHybrid, skipDedup: isHybrid });
+                const candidates = results.map(({ vector, ...result }): RankedCandidate => {
                     // Replace the collection-local RRF score with a globally
                     // comparable one. Non-hybrid collections already return
                     // cosine scores. A candidate with no stored vector keeps
@@ -707,22 +714,21 @@ export class Context {
                             scorable = false;
                         }
                     }
-                    return { result: { ...result, score, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath }, scorable };
+                    return { ...result, score, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath, scorable };
                 });
+                return this.deduplicateResults(candidates.sort(byRankOrder));
             } catch (error) {
                 console.warn(`[Context] ⚠️  Skipping collection '${r.collectionName}' in org-wide search (likely an embedding-dimension or hybrid-mode mismatch with this searcher's provider): ${error}`);
                 return [];
             }
         });
 
-        const candidates = perCollectionResults.flat();
-        const byScoreDesc = (a: OrgSearchResult, b: OrgSearchResult) => b.score - a.score;
-        const scored = candidates.filter((c) => c.scorable).map((c) => c.result).sort(byScoreDesc);
-        const unscorable = candidates.filter((c) => !c.scorable).map((c) => c.result).sort(byScoreDesc);
-        if (unscorable.length > 0) {
-            console.warn(`[Context] ⚠️  ${unscorable.length} org-wide candidates had no stored vector to re-rank by; they keep their per-collection RRF score and rank after all similarity-scored results.`);
+        const candidates = perCollectionResults.flat().sort(byRankOrder);
+        const unscorableCount = candidates.filter((c) => !c.scorable).length;
+        if (unscorableCount > 0) {
+            console.warn(`[Context] ⚠️  ${unscorableCount} org-wide candidates had no stored vector to re-rank by; they keep their per-collection RRF score and rank after all similarity-scored results.`);
         }
-        const merged = [...scored, ...unscorable];
+        const merged = candidates.map(({ scorable, ...result }) => result);
         console.log(`[Context] ✅ Org-wide search found ${merged.length} results across ${repos.length} collections, returning top ${Math.min(topK, merged.length)}`);
         return merged.slice(0, topK);
     }
@@ -767,7 +773,7 @@ export class Context {
         return results;
     }
 
-    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector; skipProbeQuery?: boolean; includeVector?: boolean }): Promise<SemanticSearchResult[]> {
+    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector; skipProbeQuery?: boolean; includeVector?: boolean; skipDedup?: boolean }): Promise<SemanticSearchResult[]> {
         const isHybrid = options?.isHybrid ?? this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}"`);
@@ -846,7 +852,10 @@ export class Context {
                 ...(options?.includeVector ? { vector: result.document.vector } : {})
             }));
 
-            const dedupedResults = this.deduplicateResults(results);
+            // Callers that re-score results afterwards (org-wide search) dedup
+            // themselves post-re-score: deduping here on RRF order could keep
+            // the weaker of two overlapping chunks.
+            const dedupedResults = options?.skipDedup ? results : this.deduplicateResults(results);
             console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
             if (dedupedResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${dedupedResults[0].score}, path: ${dedupedResults[0].relativePath}`);
@@ -885,8 +894,8 @@ export class Context {
      * Deduplicate search results by file + line range overlap.
      * Keeps higher-scored result when two results from the same file overlap >50%.
      */
-    private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
-        const kept: SemanticSearchResult[] = [];
+    private deduplicateResults<T extends SemanticSearchResult>(results: T[]): T[] {
+        const kept: T[] = [];
 
         for (const result of results) {
             const overlaps = kept.some((existing) => {

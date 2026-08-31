@@ -43,13 +43,13 @@ const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
     getCollectionRowCount: jest.fn().mockResolvedValue(0),
 });
 
-const chunk = (id: string, relativePath: string, vector: number[]) => ({
+const chunk = (id: string, relativePath: string, vector: number[], startLine = 1, endLine = 10) => ({
     id,
     vector,
     content: `content of ${relativePath}`,
     relativePath,
-    startLine: 1,
-    endLine: 10,
+    startLine,
+    endLine,
     fileExtension: '.ts',
     metadata: { language: 'typescript' },
 });
@@ -116,6 +116,43 @@ describe('semanticSearchAllRepos cross-collection ranking', () => {
             expect.any(Array),
             expect.objectContaining({ includeVector: true })
         );
+    });
+
+    test('dedup of overlapping same-file chunks keeps the higher-cosine chunk, not the higher-RRF one', async () => {
+        // Two >50%-overlapping chunks of auth.ts: chunk A wins the in-collection
+        // RRF (listed first) but has the LOWER cosine; chunk B has the higher
+        // cosine. If dedup runs on RRF order (the bug), A is kept, the file's
+        // global rank is computed from A's weaker 0.6, and it loses to another
+        // repo's 0.7 chunk. Correct behavior: keep B (0.8), rank the file first.
+        const vectorDatabase = createVectorDatabase();
+        vectorDatabase.listCollections.mockResolvedValue([
+            'hybrid_code_chunks_aaaaaaaa',
+            'hybrid_code_chunks_bbbbbbbb',
+        ]);
+        vectorDatabase.getCollectionDescription.mockImplementation(async (name: string) => {
+            if (name === 'hybrid_code_chunks_aaaaaaaa') return 'repo:github.com/bigabid/repo-a;codebasePath:/home/x/repo-a';
+            return 'repo:github.com/bigabid/repo-b;codebasePath:/home/x/repo-b';
+        });
+        vectorDatabase.hybridSearch.mockImplementation(async (collectionName: string) => {
+            if (collectionName === 'hybrid_code_chunks_aaaaaaaa') {
+                return [
+                    // Query is [1,0,0]: A → cosine 0.6, B → cosine 0.8.
+                    { document: chunk('a-A', 'auth.ts', [6, 8, 0], 1, 100), score: RRF_TOP_SCORE },
+                    { document: chunk('a-B', 'auth.ts', [8, 6, 0], 20, 100), score: RRF_TOP_SCORE - 0.001 },
+                ];
+            }
+            // cosine 0.7 — must lose to auth.ts's best chunk (0.8), beat its worst (0.6).
+            return [{ document: chunk('b-1', 'other.ts', [0.7, 0.714142842854285, 0]), score: RRF_TOP_SCORE }];
+        });
+        const context = new Context({ vectorDatabase, embedding: new TestEmbedding() });
+
+        const results = await context.semanticSearchAllRepos('anything');
+
+        expect(results).toHaveLength(2);
+        expect(results[0]).toMatchObject({ relativePath: 'auth.ts', startLine: 20 });
+        expect(results[0].score).toBeCloseTo(0.8, 5);
+        expect(results[1].relativePath).toBe('other.ts');
+        expect(results[1].score).toBeCloseTo(0.7, 5);
     });
 
     test('a hybrid candidate with no stored vector ranks below every cosine-scored result, even a negative one', async () => {
