@@ -77,6 +77,32 @@ export async function runIncrementalSync(context: Context, repoPath: string, rep
     }
 }
 
+/**
+ * Guards against forking a repo into two Milvus collections. hasIndex(repoPath)
+ * (path-based) resolves the collection name config-relatively - this worker's
+ * own HYBRID_MODE + CODE_CHUNKS_COLLECTION_NAME_OVERRIDE - so it misses a
+ * collection some OTHER indexer (a teammate's laptop, a differently-configured
+ * worker) already created for this same repo under a different config.
+ * Cross-checking by repo identity (the same tolerant lookup search_repo/
+ * search_org already rely on) catches that drift before concluding this repo
+ * has never been indexed. Call only when hasIndex(repoPath) is false; throws
+ * instead of letting the caller create a second, parallel collection for the
+ * same repo - which resolveCollectionNameForRepo would then pick between
+ * non-deterministically on every future search, while this worker kept only
+ * the fresh one up to date.
+ */
+export async function assertNoCollectionDrift(context: Context, repoPath: string, repo: DiscoveredRepo): Promise<void> {
+    const existingCollectionForRepo = await context.resolveCollectionNameForRepo(repo.cloneUrl);
+    if (existingCollectionForRepo) {
+        throw new Error(
+            `[SYNC] [${repo.fullName}] already indexed as collection '${existingCollectionForRepo}', but this worker's config ` +
+            `(HYBRID_MODE / CODE_CHUNKS_COLLECTION_NAME_OVERRIDE) computes a different name ('${context.getCollectionName(repoPath)}'). ` +
+            `Refusing to create a duplicate collection for the same repo - align this worker's config with whichever indexer ` +
+            `created '${existingCollectionForRepo}' before syncing this repo.`
+        );
+    }
+}
+
 export async function processRepo(context: Context, appAuth: AppAuth, config: SyncWorkerConfig, repo: DiscoveredRepo): Promise<void> {
     console.log(`[SYNC] [${repo.fullName}] cloning/pulling...`);
     // Fresh token per repo - a whole-org run can exceed a single
@@ -97,6 +123,11 @@ export async function processRepo(context: Context, appAuth: AppAuth, config: Sy
     }
 
     const alreadyIndexed = await context.hasIndex(repoPath);
+
+    if (!alreadyIndexed) {
+        await assertNoCollectionDrift(context, repoPath, repo);
+    }
+
     // A Milvus collection surviving with no merkle snapshot on disk (PVC
     // deleted/recreated, persistence.enabled=false, misconfigured HOME) is
     // just as much a "can't diff incrementally" case as never-indexed:

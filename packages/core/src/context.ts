@@ -365,8 +365,15 @@ export class Context {
      * that works for collections indexed before repo identity was recorded in
      * the description — then falls back to scanning listIndexedRepos() for a
      * matching `repo` field.
+     *
+     * Public so a write-path caller (e.g. sync-worker) can check, BEFORE
+     * indexing, whether a repo is already indexed under a collection name its
+     * own config wouldn't compute — path-based `hasIndex(codebasePath)` alone
+     * would miss that and index-create a second, parallel collection for the
+     * same repo, which `resolveCollectionNameForRepo` itself then resolves
+     * between non-deterministically on every future search.
      */
-    private async resolveCollectionNameForRepo(repoIdentifier: string): Promise<string | undefined> {
+    async resolveCollectionNameForRepo(repoIdentifier: string): Promise<string | undefined> {
         const hashedName = this.getCollectionNameForRepo(repoIdentifier);
         if (await this.vectorDatabase.hasCollection(hashedName)) {
             return hashedName;

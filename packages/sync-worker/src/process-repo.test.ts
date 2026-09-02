@@ -4,7 +4,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EmbeddingModelMismatchError, FileSynchronizer, type Context } from "@bigabid/claude-context-core";
-import { runFirstIndex, runIncrementalSync } from "./process-repo.js";
+import type { DiscoveredRepo } from "./github-app.js";
+import { runFirstIndex, runIncrementalSync, assertNoCollectionDrift } from "./process-repo.js";
 
 async function withTempHome(run: (tempRoot: string) => Promise<void>): Promise<void> {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "claude-context-sync-worker-"));
@@ -179,4 +180,43 @@ test("runIncrementalSync does not treat other reindex failures as model mismatch
         await assert.rejects(() => runIncrementalSync(context, repoPath, "acme/widgets", true), /milvus unavailable/);
         assert.equal(calls.indexed, false, "an unrelated failure must never trigger a destructive force reindex");
     });
+});
+
+function fakeRepo(): DiscoveredRepo {
+    return {
+        fullName: "acme/widgets",
+        cloneUrl: "https://github.com/acme/widgets.git",
+        defaultBranch: "main",
+        archived: false,
+        fork: false,
+    } as DiscoveredRepo;
+}
+
+test("assertNoCollectionDrift throws when the repo is already indexed under a different collection name (BG-4)", async () => {
+    const context = {
+        resolveCollectionNameForRepo: async (repoIdentifier: string) => {
+            assert.equal(repoIdentifier, "https://github.com/acme/widgets.git");
+            return "hybrid_code_chunks_deadbeef";
+        },
+        getCollectionName: () => "code_chunks_cafebabe",
+    } as unknown as Context;
+
+    // The bug this guards against: a config drift (this worker's HYBRID_MODE
+    // or CODE_CHUNKS_COLLECTION_NAME_OVERRIDE differs from whoever indexed the
+    // repo first) makes path-based hasIndex() miss the existing collection,
+    // so the caller would create a second, parallel one for the same repo -
+    // search_repo/search_org would then resolve between them non-deterministically.
+    await assert.rejects(
+        () => assertNoCollectionDrift(context, "/data/repos/acme/widgets", fakeRepo()),
+        /already indexed as collection 'hybrid_code_chunks_deadbeef'.*different name \('code_chunks_cafebabe'\)/s
+    );
+});
+
+test("assertNoCollectionDrift is a no-op when no collection exists for the repo identity", async () => {
+    const context = {
+        resolveCollectionNameForRepo: async () => undefined,
+        getCollectionName: () => "code_chunks_cafebabe",
+    } as unknown as Context;
+
+    await assertNoCollectionDrift(context, "/data/repos/acme/widgets", fakeRepo());
 });
