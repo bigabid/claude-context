@@ -1,0 +1,24 @@
+claude-context-mcp is deployed.
+
+1. Check the auth token is set — with no MCP_HTTP_AUTH_TOKEN, this server
+   accepts requests from anyone who can reach it, using its Milvus and
+   embedding-provider credentials:
+   kubectl -n {{ .Release.Namespace }} get secret {{ include "claude-context-mcp.secretName" . }} -o jsonpath='{.data.MCP_HTTP_AUTH_TOKEN}' | base64 -d
+{{- if .Values.externalSecret.enabled }}
+   (this Secret is managed by External Secrets Operator - if the key above is
+   empty or the command errors, check `kubectl describe externalsecret {{ include "claude-context-mcp.fullname" . }}` first)
+{{- end }}
+
+2. Port-forward to test locally:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "claude-context-mcp.fullname" . }} 3000:{{ .Values.service.port }}
+   curl http://localhost:3000/healthz
+
+3. Point Claude Code at it (once you have a real URL, e.g. via the Ingress):
+   claude mcp add --transport http claude-context-org https://<your-host>{{ .Values.ingress.path }} \
+     --header "Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>"
+
+{{- if not .Values.ingress.enabled }}
+
+Note: ingress.enabled is false — this release is only reachable inside the
+cluster (or via port-forward) until you enable it.
+{{- end }}

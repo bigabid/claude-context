@@ -1,0 +1,40 @@
+{
+    "name": "@bigabid/claude-context-sync-worker",
+    "version": "0.1.7",
+    "description": "Standalone batch job: auto-discovers a GitHub org's repos via a GitHub App and keeps them indexed in the shared Claude Context vector DB",
+    "type": "module",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "pnpm clean && tsc --build --force",
+        "clean": "rimraf dist",
+        "lint": "eslint src --ext .ts",
+        "lint:fix": "eslint src --ext .ts --fix",
+        "typecheck": "tsc --noEmit",
+        "test": "node --import tsx --test src/*.test.ts",
+        "start": "tsx src/index.ts"
+    },
+    "dependencies": {
+        "@bigabid/claude-context-core": "workspace:*",
+        "@octokit/auth-app": "^7.1.5",
+        "@octokit/rest": "^21.1.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "rimraf": "^6.0.1",
+        "tsx": "^4.19.4",
+        "typescript": "^5.0.0"
+    },
+    "files": [
+        "dist",
+        "README.md"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/bigabid/claude-context.git",
+        "directory": "packages/sync-worker"
+    },
+    "license": "MIT",
+    "publishConfig": {
+        "registry": "https://npm.pkg.github.com"
+    }
+}

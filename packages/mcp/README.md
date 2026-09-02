@@ -34,7 +34,7 @@ Claude Context MCP supports multiple embedding providers. Choose the one that be
 > 📋 **Quick Reference**: For a complete list of environment variables and their descriptions, see the [Environment Variables Guide](../../docs/getting-started/environment-variables.md).
 
 ```bash
-# Supported providers: OpenAI, VoyageAI, Gemini, Ollama
+# Supported providers: OpenAI, VoyageAI, Gemini, Ollama, OpenRouter, Bedrock
 EMBEDDING_PROVIDER=OpenAI
 ```
 
@@ -152,6 +152,45 @@ EMBEDDING_DIMENSION=768
 
 </details>
 
+<details>
+<summary><strong>5. Amazon Bedrock Configuration</strong></summary>
+
+Amazon Bedrock lets you use managed embedding models (Titan, Cohere) from your own AWS account, keeping traffic inside your AWS network/VPC.
+
+```bash
+EMBEDDING_PROVIDER=Bedrock
+
+# Required: AWS region for Bedrock Runtime (falls back to AWS_REGION)
+BEDROCK_REGION=us-east-1
+
+# Optional: Specify embedding model (default: amazon.titan-embed-text-v2:0)
+EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
+
+# Optional: static credentials. If omitted, the default AWS credential chain
+# is used (env vars, shared config/profile, IAM role, ECS/EC2 instance role, etc).
+BEDROCK_ACCESS_KEY_ID=your-access-key-id
+BEDROCK_SECRET_ACCESS_KEY=your-secret-access-key
+BEDROCK_SESSION_TOKEN=your-session-token
+
+# Optional: custom endpoint, e.g. a VPC interface endpoint for Bedrock Runtime
+BEDROCK_ENDPOINT=https://vpce-xxxx.bedrock-runtime.us-east-1.vpce.amazonaws.com
+
+# Optional: dimension override (only honored by amazon.titan-embed-text-v2:0,
+# which supports 256/512/1024)
+BEDROCK_EMBEDDING_DIMENSION=1024
+```
+
+**Available Models:**
+See `getSupportedModels` in [`bedrock-embedding.ts`](https://github.com/zilliztech/claude-context/blob/master/packages/core/src/embedding/bedrock-embedding.ts) for the full list of supported models (Titan and Cohere embedding models).
+
+**Prerequisites:**
+
+1. Request access to the embedding model(s) you want in the [Bedrock console model access page](https://console.aws.amazon.com/bedrock/home#/modelaccess) for your chosen region.
+2. Either configure AWS credentials locally (`aws configure`, an assumed role, or an EC2/ECS instance role) or set `BEDROCK_ACCESS_KEY_ID`/`BEDROCK_SECRET_ACCESS_KEY` explicitly.
+3. Grant the credentials the `bedrock:InvokeModel` IAM permission for the embedding model(s) you use.
+
+</details>
+
 #### Get a free vector database on Zilliz Cloud
 
 Claude Context needs a vector database. You can [sign up](https://cloud.zilliz.com/signup?utm_source=github&utm_medium=referral&utm_campaign=2507-codecontext-readme) on Zilliz Cloud to get an API key.
@@ -200,6 +239,17 @@ CODE_CHUNKS_COLLECTION_NAME_OVERRIDE=my_project
 
 The per-codebase `<pathHash>` suffix is preserved even when the override is set, so the same MCP server can still index multiple repos without collapsing them onto one collection. The override value is sanitized to letters, numbers, and underscores, and truncated to keep the full name within Milvus's 255-char limit. If you unset the variable later, Claude Context switches back to the plain `code_chunks_<pathHash>` naming.
 
+#### Collection Key Source (Optional)
+
+By default, the `<pathHash>` in a collection name is derived from the codebase's absolute local path, so two checkouts of the same repo (e.g. a CI runner and your laptop) get different collections. Use this to key it off the repo's git remote instead, so every checkout of the same repo converges on one shared collection:
+
+```bash
+# Hash the "origin" remote URL instead of the local path
+CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote
+```
+
+SSH and HTTPS forms of the same remote (`git@github.com:org/repo.git` vs `https://github.com/org/repo.git`) normalize to the same identity and hash. Falls back to the path-based hash when the codebase isn't a git repo or has no `origin` remote.
+
 #### Trigger File Watcher (Optional)
 
 In addition to the periodic background sync, the MCP server watches a sentinel file at `~/.context/.sync-trigger` and starts an immediate re-index whenever the file is modified. This lets external tools (Claude Code `PostToolUse` hooks, editor save hooks, CI scripts, etc.) request a sync on demand instead of waiting for the next polling tick.
@@ -242,6 +292,49 @@ CLAUDE_CONTEXT_SYNC_INTERVAL_MS=60000
 ```
 
 For multi-instance local stdio setups, set `CLAUDE_CONTEXT_BACKGROUND_SYNC=false` and keep the trigger watcher enabled. That avoids idle polling while still allowing external tools to request immediate re-indexing by touching `~/.context/.sync-trigger`.
+
+## Hosting as a Shared Server (HTTP Transport)
+
+By default the server runs over stdio: one local process per user, spawned by their MCP client. To run one shared server instead (e.g. so a team can search each other's indexed repos without everyone running their own process), switch to the Streamable HTTP transport:
+
+```bash
+MCP_TRANSPORT=http                    # default: stdio
+MCP_HTTP_PORT=3000                    # default: 3000
+MCP_HTTP_PATH=/mcp                    # default: /mcp
+MCP_HTTP_AUTH_TOKEN=<a-random-secret>  # strongly recommended - see warning below
+MCP_LOG_LEVEL=info                    # default: info - see Logging below
+```
+
+The server is stateless per request (`sessionIdGenerator: undefined`), so any replica can serve any request — no session affinity or shared session store needed behind a load balancer. A `/healthz` endpoint is included for liveness/readiness probes.
+
+Request bodies over 10 MiB are rejected with `413 { "error": "Payload too large" }`.
+
+⚠️ **`MCP_HTTP_AUTH_TOKEN` is not set by default.** Without it, this server accepts requests from anyone who can reach the port and uses ITS Milvus and embedding-provider credentials to serve them — set it before exposing this beyond localhost. Clients must send it as `Authorization: Bearer <token>`.
+
+Point a client at it instead of spawning a local process, e.g.:
+
+```bash
+claude mcp add --transport http claude-context-org https://<your-host>/mcp \
+  --header "Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>"
+```
+
+Note: a shared HTTP server has no access to any user's local git checkouts, so `index_codebase`/`clear_index`/`get_indexing_status`/`search_code` are hidden in this mode (they need a local path — see [Available Tools](#available-tools) above) — the hosted server is for `search_repo`/`search_org`/`list_indexed_repos` against already-indexed collections. To keep those collections fresh automatically instead of relying on someone's laptop, see [`@bigabid/claude-context-sync-worker`](../sync-worker/README.md) — a scheduled job that auto-discovers a GitHub org's repos and indexes them.
+
+### Logging
+
+`MCP_LOG_LEVEL` (`debug` | `info` (default) | `warn` | `error`) controls verbosity. This matters most for a shared HTTP deployment, where every log line lands in one pod's `kubectl logs` for every user's requests combined. Set it to `warn` or `error` to drop normal lifecycle logs (startup config summary, background sync status) as well as internal `[...DEBUG]`-tagged tracing — real warnings and errors (auth misconfiguration, unreachable Milvus/embedding endpoint, etc.) are never suppressed.
+
+### Docker / Kubernetes (EKS)
+
+A multi-arch (linux/amd64 + linux/arm64) `Dockerfile` is at the repo root, and a Helm chart is at [`deploy/helm/claude-context-mcp`](../../deploy/helm/claude-context-mcp) (Deployment, Service, optional Ingress/HPA/PodDisruptionBudget, and three ways to source secrets — `externalSecret` for [External Secrets Operator](https://external-secrets.io), `existingSecret`, or `secret.create` for dev/test only). See that chart's `values.yaml` for the full set of options.
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t <your-registry>/claude-context-mcp:<tag> --push .
+
+helm upgrade --install claude-context-mcp deploy/helm/claude-context-mcp \
+  --set image.repository=<your-registry>/claude-context-mcp \
+  --set image.tag=<tag>
+```
 
 ## Usage with MCP Clients
 
@@ -669,11 +762,13 @@ For LangChain/LangGraph integration examples, see [this example](https://github.
 <details>
 <summary><strong>Other MCP Clients</strong></summary>
 
-The server uses stdio transport and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
+The server uses stdio transport by default and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
 
 ```bash
 npx @zilliz/claude-context-mcp@latest
 ```
+
+For hosting one shared server instead of a per-user local process, see [Hosting as a Shared Server (HTTP Transport)](#hosting-as-a-shared-server-http-transport) above.
 
 </details>
 
@@ -689,6 +784,8 @@ npx @zilliz/claude-context-mcp@latest
 - ⚡ **Real-time**: Interactive indexing and searching with progress feedback
 
 ## Available Tools
+
+> Tools 1–3 below (`index_codebase`, `search_code`, `clear_index`) plus `get_indexing_status` operate on a local filesystem path and only make sense for the stdio transport (one process per user's checkout). When hosted over the [Streamable HTTP transport](#hosting-as-a-shared-server-http-transport), the server is shared/stateless with no checkout of its own, so these four are hidden from the tool list and rejected if called anyway — only `list_indexed_repos`, `search_repo`, and `search_org` are exposed in that mode. (`search_code` in particular would silently misbehave over http rather than just being a worse choice: its collection lookup reads `.git/config` from the given path *on the server's own filesystem*, which doesn't exist there, so it would always report "not indexed".)
 
 ### 1. `index_codebase`
 
@@ -738,6 +835,32 @@ Get the current indexing status of a codebase. Shows progress percentage for act
 - If a completed entry shows `0 files, 0 chunks`, that usually means the local snapshot metadata is stale rather than the vector database being queried live. Re-indexing, or clearing and re-indexing that exact absolute path, refreshes the stored stats.
 
 For a deeper explanation, see the [asynchronous indexing workflow guide](../../docs/dive-deep/asynchronous-indexing-workflow.md) and the [troubleshooting FAQ](../../docs/troubleshooting/faq.md).
+
+### 5. `list_indexed_repos`
+
+List every repo/collection currently indexed in the shared vector database — no parameters. Use this to discover what's searchable when you don't already have a repo identity string in hand, or don't have any local checkout at all. Returns each repo's identity string (e.g. `github.com/org/repo`) alongside its collection name; collections indexed before this repo-identity tracking existed are reported as "unknown repo identity" until re-indexed.
+
+### 6. `search_repo`
+
+Search an indexed repo by its git remote identity (e.g. `github.com/org/repo`) instead of a local absolute path — no local checkout of that repo required at all.
+
+**Parameters:**
+
+- `repo` (required): Repo identity string as reported by `list_indexed_repos`, or any git remote URL for that repo (`https://` or `git@` form)
+- `query` (required): Natural language query to search for in the repo
+- `limit` (optional): Maximum number of results to return (default: 10, max: 50)
+- `extensionFilter` (optional): List of file extensions to filter results (default: [])
+
+### 7. `search_org`
+
+Search across EVERY indexed repo at once, merged and ranked by score. This is the default tool for any question that isn't anchored to a specific repo you can already name — not just a last resort for "neither you nor the user knows which repo the answer is in." Being inside a local checkout doesn't mean the answer lives there; don't guess a repo name to avoid this tool when you're unsure — an uncertain guess searches the wrong place, this doesn't.
+
+**Parameters:**
+
+- `query` (required): Natural language query to search for across every indexed repo
+- `limit` (optional): Maximum number of results to return (default: 10, max: 50)
+
+Slower than `search_repo`/`search_code` since it queries every indexed collection — that's a normal, expected cost, not a reason to avoid it when the repo isn't already known. A collection that errors during the fan-out (e.g. an embedding-dimension mismatch because it was indexed with a different provider) is skipped and logged rather than failing the whole search.
 
 ## Contributing
 

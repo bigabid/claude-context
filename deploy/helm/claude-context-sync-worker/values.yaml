@@ -1,0 +1,133 @@
+# Default values for claude-context-sync-worker.
+
+# This worker is the SOLE indexer for whichever repos it covers - it does not
+# coordinate with laptop-side `index_codebase` runs, and two indexers working
+# from different checkouts of the same repo can delete each other's vectors
+# (see packages/sync-worker/README.md). Stop laptop-indexing a repo once this
+# covers it.
+
+schedule: "*/30 * * * *"
+concurrencyPolicy: Forbid
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+# A whole-org run must fit inside a single GitHub App installation token's
+# ~1h lifetime for any repos processed after the first (a fresh token is
+# minted per repo, but this is still a sane outer bound on a stuck run).
+activeDeadlineSeconds: 3600
+backoffLimit: 1
+
+image:
+  repository: ""  # e.g. <account-id>.dkr.ecr.<region>.amazonaws.com/claude-context-sync-worker
+  tag: ""         # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 2Gi
+
+# Repo checkouts AND the merkle sync-state (~/.context/merkle/*.json) that
+# makes reindexByChange incremental both live on this PVC, so both survive
+# between CronJob runs. With persistence.enabled=false, the merkle snapshot
+# is gone on every run even though the Milvus collection isn't; processRepo
+# detects that mismatch (collection exists, no on-disk snapshot) and forces
+# a full re-index, so every run is a full re-clone + re-embed of every repo
+# instead of an incremental diff.
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClassName: ""
+  accessMode: ReadWriteOnce
+  # Set to reuse a PVC this chart doesn't manage, instead of creating one.
+  existingClaim: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+github:
+  appId: ""
+  installationId: ""
+  org: ""  # informational only - the installation ID already scopes discovery
+  excludeRepos: []
+  #   - some-org/huge-irrelevant-monorepo
+  includeArchived: false
+  includeForks: false
+
+# How many repos to clone/index at once - repos are independent (separate
+# collections, separate checkouts), so this doesn't need to be 1. Tune down
+# if this overwhelms the embedding endpoint or Milvus; tune up once you've
+# confirmed they handle it, to get through a large org faster.
+concurrency: 4
+
+# Non-secret env vars (EMBEDDING_PROVIDER, EMBEDDING_MODEL, etc). These MUST
+# match whatever produced the existing collections (same HYBRID_MODE, same
+# embedding model/dimension) or this worker creates parallel collections
+# instead of updating the real ones - see packages/sync-worker/README.md.
+env:
+  EMBEDDING_PROVIDER: OpenAI
+  EMBEDDING_MODEL: ""
+
+extraEnv: []
+#   - name: FOO
+#     value: bar
+
+# Key inside the resolved Secret (whichever of the three modes below is
+# active) holding the GitHub App's private key PEM. Mounted as a file rather
+# than an env var, since PEM keys are multi-line and awkward as env var
+# values - GITHUB_APP_PRIVATE_KEY_PATH is set to point at the mounted file.
+githubAppPrivateKeySecretKey: GITHUB_APP_PRIVATE_KEY
+
+# Name of an existing Kubernetes Secret containing at minimum the key named
+# by githubAppPrivateKeySecretKey above, plus MILVUS_ADDRESS, MILVUS_TOKEN,
+# and the embedding provider's API key. Ignored if externalSecret.enabled.
+existingSecret: ""
+
+# Recommended path when External Secrets Operator is installed: this chart
+# creates the ExternalSecret resource itself.
+externalSecret:
+  enabled: false
+  secretName: ""
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ""
+    kind: ClusterSecretStore
+  data: []
+  #   - secretKey: GITHUB_APP_PRIVATE_KEY
+  #     remoteRef:
+  #       key: claude-context/github-app-private-key
+  #   - secretKey: MILVUS_TOKEN
+  #     remoteRef:
+  #       key: claude-context/milvus
+  #       property: token
+  dataFrom: []
+
+# Dev/test convenience only - do NOT use in a real environment.
+secret:
+  create: false
+  data: {}

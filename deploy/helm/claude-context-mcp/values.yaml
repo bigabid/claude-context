@@ -1,0 +1,159 @@
+# Default values for claude-context-mcp.
+
+replicaCount: 2
+
+image:
+  repository: ""  # e.g. <account-id>.dkr.ecr.<region>.amazonaws.com/claude-context-mcp
+  tag: ""         # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false  # snapshot/merkle state is written under $HOME/.context
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+# The MCP server is stateless across requests (see MCP_TRANSPORT=http in the
+# image), so a plain Ingress/ALB with no session affinity works - any pod can
+# serve any request.
+ingress:
+  enabled: false
+  className: alb
+  annotations: {}
+  #   alb.ingress.kubernetes.io/scheme: internal
+  #   alb.ingress.kubernetes.io/target-type: ip
+  #   alb.ingress.kubernetes.io/healthcheck-path: /healthz
+  host: ""
+  path: /mcp
+  pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# Non-secret configuration, applied as plain env vars.
+# MCP_TRANSPORT/MCP_HTTP_PORT/MCP_HTTP_PATH/CLAUDE_CONTEXT_BACKGROUND_SYNC
+# already default correctly in the image - override here only if needed.
+env:
+  EMBEDDING_PROVIDER: OpenAI
+  EMBEDDING_MODEL: ""
+
+# Anything else the container needs as a plain (non-secret) env var.
+# - name: FOO
+#   value: bar
+extraEnv: []
+
+# Name of an existing Kubernetes Secret, already materialized by some
+# external process (e.g. a hand-rolled ExternalSecret this chart doesn't
+# manage) containing at minimum:
+#   MCP_HTTP_AUTH_TOKEN, MILVUS_ADDRESS, MILVUS_TOKEN, OPENAI_API_KEY
+# (or the relevant provider's key/region/etc - see packages/mcp --help).
+# Ignored if externalSecret.enabled is true. Prefer externalSecret below if
+# External Secrets Operator is installed in the cluster - it's one fewer
+# thing to hand-manage outside this chart.
+existingSecret: ""
+
+# Recommended path when External Secrets Operator (https://external-secrets.io)
+# is installed in the cluster: this chart creates the ExternalSecret resource
+# itself, which ESO reconciles into a real Secret from your backend (AWS
+# Secrets Manager, etc) - nothing secret ever lives in values.yaml or Git.
+externalSecret:
+  enabled: false
+  # Name of the Kubernetes Secret ESO will create/manage. Defaults to the
+  # release fullname if left blank.
+  secretName: ""
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ""                      # e.g. aws-secretsmanager
+    kind: ClusterSecretStore      # or SecretStore
+  # Maps each key in the resulting k8s Secret to one remote secret reference.
+  # Use this OR dataFrom, not typically both.
+  data: []
+  #   - secretKey: MCP_HTTP_AUTH_TOKEN
+  #     remoteRef:
+  #       key: claude-context/mcp-http-auth-token
+  #   - secretKey: MILVUS_ADDRESS
+  #     remoteRef:
+  #       key: claude-context/milvus
+  #       property: address
+  #   - secretKey: MILVUS_TOKEN
+  #     remoteRef:
+  #       key: claude-context/milvus
+  #       property: token
+  #   - secretKey: OPENAI_API_KEY
+  #     remoteRef:
+  #       key: claude-context/openai
+  #       property: api_key
+  # Alternative to `data`: pull every key/value from one remote secret as-is.
+  dataFrom: []
+  #   - extract:
+  #       key: claude-context/mcp-all
+
+# Dev/test convenience only: let the chart create the Secret directly from
+# values (which usually means committing secrets to Git). Do NOT use this in
+# a real environment - use existingSecret + External Secrets Operator instead.
+secret:
+  create: false
+  data: {}
+  #   MCP_HTTP_AUTH_TOKEN: "changeme"
+  #   MILVUS_ADDRESS: "https://milvus.example.com"
+  #   MILVUS_TOKEN: "..."
+  #   OPENAI_API_KEY: "..."
