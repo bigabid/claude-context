@@ -16,7 +16,7 @@ import {
     HybridSearchOptions,
     HybridSearchResult
 } from './vectordb';
-import { SemanticSearchResult } from './types';
+import { SemanticSearchResult, OrgSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -52,6 +52,25 @@ export class EmbeddingError extends Error {
         this.name = 'EmbeddingError';
     }
 }
+
+/**
+ * Thrown when an index/reindex would write vectors from one embedding model
+ * into a collection recorded as belonging to another (see
+ * `ensureCollectionModelMatches`). Typed so operational callers (e.g. the
+ * sync-worker) can distinguish "operator changed the embedding model" — which
+ * has a deliberate recovery path, force reindex — from a real failure.
+ */
+export class EmbeddingModelMismatchError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'EmbeddingModelMismatchError';
+    }
+}
+
+// Cap on concurrent Milvus round trips during semanticSearchAllRepos's
+// fan-out. Without a bound, an org with hundreds of indexed collections
+// opens that many concurrent requests per search_org call.
+const ORG_SEARCH_CONCURRENCY = 15;
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -268,8 +287,8 @@ export class Context {
     /**
      * Public wrapper for prepareCollection private method
      */
-    async getPreparedCollection(codebasePath: string): Promise<void> {
-        return this.prepareCollection(codebasePath);
+    async getPreparedCollection(codebasePath: string, forceReindex: boolean = false): Promise<void> {
+        return this.prepareCollection(codebasePath, forceReindex);
     }
 
     /**
@@ -284,13 +303,25 @@ export class Context {
     }
 
     /**
-     * Generate collection name based on codebase path and hybrid mode
+     * Generate collection name based on codebase path (or git remote identity) and hybrid mode
      */
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        const normalizedPath = path.resolve(codebasePath);
-        const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
+
+        // Default identity is the absolute path, so distinct checkouts of the same
+        // repo get distinct collections. Opting into CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote
+        // switches to the repo's remote URL instead, so every checkout of the same
+        // repo (CI, every teammate's laptop, etc.) converges on the same collection.
+        let hashInput = path.resolve(codebasePath);
+        const keySource = envManager.get('CODE_CHUNKS_COLLECTION_KEY_SOURCE');
+        if (keySource?.trim().toLowerCase() === 'git-remote') {
+            const remoteIdentity = this.getGitRemoteIdentity(codebasePath);
+            if (remoteIdentity) {
+                hashInput = remoteIdentity;
+            }
+        }
+        const pathHash = crypto.createHash('md5').update(hashInput).digest('hex').substring(0, 8);
 
         // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
         // codebases indexed by the same MCP server can't collapse into one collection.
@@ -307,6 +338,103 @@ export class Context {
         }
 
         return `${prefix}_${pathHash}`;
+    }
+
+    /**
+     * Generate the collection name for a repo identity string directly (e.g.
+     * "github.com/org/repo", or any git remote URL form), with no local
+     * checkout required. Use this to search/check a repo nobody has cloned
+     * on this machine — pair it with `listIndexedRepos()` to discover valid
+     * identity strings, since they must match exactly what `getCollectionName`
+     * would have normalized from that repo's real git remote.
+     */
+    public getCollectionNameForRepo(repoIdentifier: string): string {
+        const isHybrid = this.getIsHybrid();
+        const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
+        const normalized = this.normalizeGitRemoteUrl(repoIdentifier) ?? repoIdentifier.trim().toLowerCase();
+        const pathHash = crypto.createHash('md5').update(normalized).digest('hex').substring(0, 8);
+        return `${prefix}_${pathHash}`;
+    }
+
+    /**
+     * Resolve the actual collection name for a repo identity, tolerating the
+     * case where whoever indexed it used a different HYBRID_MODE or
+     * CODE_CHUNKS_COLLECTION_NAME_OVERRIDE than this process would compute
+     * (getCollectionNameForRepo can't know either of those settings for the
+     * indexing side). Tries the direct hash first — cheap, and the only path
+     * that works for collections indexed before repo identity was recorded in
+     * the description — then falls back to scanning listIndexedRepos() for a
+     * matching `repo` field.
+     *
+     * Public so a write-path caller (e.g. sync-worker) can check, BEFORE
+     * indexing, whether a repo is already indexed under a collection name its
+     * own config wouldn't compute — path-based `hasIndex(codebasePath)` alone
+     * would miss that and index-create a second, parallel collection for the
+     * same repo, which `resolveCollectionNameForRepo` itself then resolves
+     * between non-deterministically on every future search.
+     */
+    async resolveCollectionNameForRepo(repoIdentifier: string): Promise<string | undefined> {
+        const hashedName = this.getCollectionNameForRepo(repoIdentifier);
+        if (await this.vectorDatabase.hasCollection(hashedName)) {
+            return hashedName;
+        }
+        const normalizedTarget = this.normalizeGitRemoteUrl(repoIdentifier) ?? repoIdentifier.trim().toLowerCase();
+        const repos = await this.listIndexedRepos();
+        return repos.find((r) => r.repo === normalizedTarget)?.collectionName;
+    }
+
+    /**
+     * Resolve a repo-stable identity string (e.g. "github.com/org/repo") from the
+     * codebase's git remote "origin", or undefined if it can't be determined
+     * (not a git repo, no origin remote, unreadable config, etc).
+     */
+    private getGitRemoteIdentity(codebasePath: string): string | undefined {
+        try {
+            const gitConfigPath = path.join(path.resolve(codebasePath), '.git', 'config');
+            if (!fs.existsSync(gitConfigPath) || !fs.statSync(gitConfigPath).isFile()) {
+                return undefined;
+            }
+            const configContent = fs.readFileSync(gitConfigPath, 'utf-8');
+            const originMatch = configContent.match(/\[remote "origin"\][^[]*/);
+            if (!originMatch) {
+                return undefined;
+            }
+            const urlMatch = originMatch[0].match(/url\s*=\s*(.+)/);
+            if (!urlMatch) {
+                return undefined;
+            }
+            return this.normalizeGitRemoteUrl(urlMatch[1].trim());
+        } catch (error) {
+            console.warn(`[Context] ⚠️ Failed to read git remote for ${codebasePath}: ${error}`);
+            return undefined;
+        }
+    }
+
+    /**
+     * Normalize a git remote URL (SSH, HTTPS, or git protocol, with or without a
+     * trailing ".git") into a host-agnostic "<host>/<path>" identity string, so
+     * that different clone styles of the same repo hash to the same value.
+     */
+    private normalizeGitRemoteUrl(url: string): string | undefined {
+        let normalized = url.trim();
+        if (normalized.length === 0) {
+            return undefined;
+        }
+
+        // scp-like SSH syntax: git@host:org/repo(.git)
+        const scpMatch = normalized.match(/^(?:[^@]+@)?([^:/]+):(.+)$/);
+        if (!normalized.includes('://') && scpMatch) {
+            normalized = `${scpMatch[1]}/${scpMatch[2]}`;
+        } else {
+            // URL syntax: scheme://[user@]host/path(.git)
+            normalized = normalized.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '');
+            normalized = normalized.replace(/^[^@/]+@/, '');
+        }
+
+        normalized = normalized.replace(/\.git\/?$/, '');
+        normalized = normalized.replace(/\/+$/, '');
+
+        return normalized.toLowerCase();
     }
 
     private getValidOverrideValue(value?: string): string | undefined {
@@ -452,6 +580,14 @@ export class Context {
 
         const currentSynchronizer = this.synchronizers.get(collectionName)!;
 
+        // The model guard MUST run before checkForChanges: checkForChanges
+        // persists the advanced merkle snapshot as soon as it detects changes,
+        // so throwing after it would fire exactly once — every later run would
+        // find "no changes" against the already-advanced snapshot and report
+        // the repo healthy forever while its updates never reached the vector
+        // DB. Costs one describeCollection per sync tick; correctness wins.
+        await this.ensureCollectionModelMatches(collectionName);
+
         progressCallback?.({ phase: 'Checking for file changes...', current: 0, total: 100, percentage: 0 });
         const { added, removed, modified } = await currentSynchronizer.checkForChanges();
         const totalChanges = added.length + removed.length + modified.length;
@@ -529,11 +665,202 @@ export class Context {
      * @param threshold Similarity threshold
      */
     async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
-        const isHybrid = this.getIsHybrid();
-        const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
-        console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
-
         const collectionName = this.getCollectionName(codebasePath);
+        console.log(`[Context] 🔍 Search target: ${codebasePath}`);
+        return this.searchInCollection(collectionName, query, topK, threshold, filterExpr);
+    }
+
+    /**
+     * Search a repo by its git remote identity string directly (e.g.
+     * "github.com/org/repo") instead of a local codebase path — no local
+     * checkout required. See `getCollectionNameForRepo` and `listIndexedRepos`.
+     */
+    async semanticSearchByRepo(repoIdentifier: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
+        console.log(`[Context] 🔍 Search target (by repo identity): ${repoIdentifier}`);
+        const collectionName = await this.resolveCollectionNameForRepo(repoIdentifier);
+        if (!collectionName) {
+            console.log(`[Context] ⚠️  No indexed collection found for repo identity '${repoIdentifier}'.`);
+            return [];
+        }
+        return this.searchInCollection(collectionName, query, topK, threshold, filterExpr);
+    }
+
+    /**
+     * Search every indexed repo/collection in the vector DB at once — for when
+     * the caller doesn't know (or doesn't want to specify) which repo to search.
+     * See `listIndexedRepos` for what "every indexed repo" means and
+     * `search_repo`/`semanticSearchByRepo` for searching one repo by identity.
+     *
+     * Candidates are selected per collection (hybrid RRF within a repo), but the
+     * cross-collection ranking uses dense cosine similarity to the query, NOT the
+     * per-collection RRF score. RRF scores are rank positions in disguise
+     * (1/(k+rank)): every collection's #1 chunk gets the identical value whether
+     * it's a perfect match or the least-bad chunk of a tiny repo, so merging by
+     * them made the org-wide top-K an arbitrary tie-break that buried relevant
+     * code under READMEs (DEV_FS-3937). Cosine scores come from one shared
+     * embedding model, so they are comparable across collections.
+     *
+     * Each collection is searched independently and a failure there (e.g. an
+     * embedding-dimension mismatch because it was indexed with a different
+     * provider, or a hybrid/non-hybrid mismatch) is logged and skipped rather
+     * than failing the whole org-wide search.
+     */
+    async semanticSearchAllRepos(query: string, topK: number = 10, threshold: number = 0.5): Promise<OrgSearchResult[]> {
+        const repos = await this.listIndexedRepos();
+        if (repos.length === 0) {
+            console.log(`[Context] ⚠️  No indexed repos found for org-wide search.`);
+            return [];
+        }
+
+        console.log(`[Context] 🔍 Org-wide search across ${repos.length} collections: "${query}"`);
+        const precomputedEmbedding = await this.embedding.embed(query);
+
+        type RankedCandidate = OrgSearchResult & { scorable: boolean };
+        const byRankOrder = (a: RankedCandidate, b: RankedCandidate) =>
+            (Number(b.scorable) - Number(a.scorable)) || (b.score - a.score);
+
+        const searcherModel = this.getEmbeddingModelIdentity();
+        const perCollectionResults = await this.mapWithConcurrency(repos, ORG_SEARCH_CONCURRENCY, async (r): Promise<RankedCandidate[]> => {
+            const isHybrid = r.collectionName.startsWith('hybrid_code_chunks_');
+            // A collection recorded with a DIFFERENT embedding model lives in a
+            // foreign vector space: its cosines against our query embedding are
+            // meaningless even when the dimensions happen to match, so its
+            // candidates go to the unscorable trailing bucket. Collections with
+            // no recorded model (indexed before tagging existed) are assumed to
+            // match — the deployment has one shared model, and treating them as
+            // mismatched would demote every legacy collection.
+            const modelMismatch = r.embeddingModel !== undefined && r.embeddingModel !== searcherModel;
+            const rescorable = isHybrid && !modelMismatch;
+            try {
+                // Hybrid collections skip in-collection dedup: dedup keeps the
+                // first-seen of two overlapping chunks, and on RRF order that
+                // can be the lower-cosine one. We dedup below, after re-scoring.
+                const results = await this.searchInCollection(r.collectionName, query, topK, threshold, undefined, { isHybrid, precomputedEmbedding, skipProbeQuery: true, includeVector: rescorable, skipDedup: rescorable });
+                const candidates = results.map(({ vector, ...result }): RankedCandidate => {
+                    // Replace the collection-local RRF score with a globally
+                    // comparable one. Non-hybrid collections already return
+                    // cosine scores. A candidate with no stored vector keeps
+                    // its RRF score for display but is ranked in a trailing
+                    // bucket below every cosine-scored result (a cosine can be
+                    // lower than the RRF score, even negative) — acceptable
+                    // degradation for a broken/legacy collection.
+                    let score = result.score;
+                    let scorable = !modelMismatch;
+                    if (rescorable) {
+                        if (vector && vector.length === precomputedEmbedding.vector.length) {
+                            score = Context.cosineSimilarity(precomputedEmbedding.vector, vector);
+                        } else {
+                            scorable = false;
+                        }
+                    }
+                    return { ...result, score, collectionName: r.collectionName, repo: r.repo, codebasePath: r.codebasePath, scorable };
+                });
+                return this.deduplicateResults(candidates.sort(byRankOrder));
+            } catch (error) {
+                console.warn(`[Context] ⚠️  Skipping collection '${r.collectionName}' in org-wide search (likely an embedding-dimension or hybrid-mode mismatch with this searcher's provider): ${error}`);
+                return [];
+            }
+        });
+
+        const candidates = perCollectionResults.flat().sort(byRankOrder);
+        const unscorableCount = candidates.filter((c) => !c.scorable).length;
+        if (unscorableCount > 0) {
+            console.warn(`[Context] ⚠️  ${unscorableCount} org-wide candidates could not be similarity-ranked (no stored vector, or indexed with a different embedding model); they keep their per-collection score and rank after all similarity-scored results.`);
+        }
+        const merged = candidates.map(({ scorable, ...result }) => result);
+        console.log(`[Context] ✅ Org-wide search found ${merged.length} results across ${repos.length} collections, returning top ${Math.min(topK, merged.length)}`);
+        return merged.slice(0, topK);
+    }
+
+    /**
+     * `provider/model` identity of this Context's embedding, as recorded in
+     * collection descriptions at index time and compared during org-wide
+     * search. Both sides are built by this method, so the comparison is exact.
+     */
+    private getEmbeddingModelIdentity(): string {
+        const identity = `${this.embedding.getProvider()}/${this.embedding.getModel()}`;
+        // The identity is written verbatim into the ';'-delimited collection
+        // description, and EMBEDDING_MODEL is a free-form env var. A ';' (or
+        // newline) would truncate the recorded tag, making this very indexer
+        // see a permanent mismatch against itself — with the sync-worker's
+        // recovery flag on, that means re-embedding every collection on every
+        // run. Refuse loudly instead.
+        if (/[;\r\n]/.test(identity)) {
+            throw new Error(
+                `Invalid embedding model identity '${identity.replace(/[\r\n]/g, '\\n')}': it must not contain ';' or newlines. ` +
+                `Check the EMBEDDING_MODEL / EMBEDDING_PROVIDER configuration for copy-paste artifacts.`
+            );
+        }
+        return identity;
+    }
+
+    /**
+     * Refuse to write into an existing collection whose recorded embedding
+     * model differs from this Context's — Milvus descriptions are immutable,
+     * so indexing on would produce a collection whose vectors and tag disagree
+     * (or a silent mix of incompatible vector spaces). Collections with no
+     * recorded model (created before tagging existed) are assumed to match.
+     */
+    private async ensureCollectionModelMatches(collectionName: string): Promise<void> {
+        // Fail closed: if the description can't be read, the model can't be
+        // verified, and proceeding could silently mix vector spaces — the
+        // exact corruption this guard exists to prevent. Callers treat the
+        // error as a per-run failure and retry next tick.
+        const description = await this.vectorDatabase.getCollectionDescription(collectionName);
+        const recorded = description.match(/(?:^|;)embeddingModel:([^;]*)/)?.[1]?.trim() || undefined;
+        const current = this.getEmbeddingModelIdentity();
+        if (recorded !== undefined && recorded !== current) {
+            throw new EmbeddingModelMismatchError(
+                `Collection '${collectionName}' was indexed with embedding model '${recorded}', but this indexer is configured with '${current}'. ` +
+                `Refusing to mix vector spaces — force a full reindex to rebuild the collection with the current model.`
+            );
+        }
+    }
+
+    /**
+     * Cosine similarity between two equal-length vectors. Embeddings are not
+     * assumed normalized. Returns 0 when either vector has zero magnitude.
+     */
+    private static cosineSimilarity(a: number[], b: number[]): number {
+        let dot = 0;
+        let normA = 0;
+        let normB = 0;
+        for (let i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            normA += a[i] * a[i];
+            normB += b[i] * b[i];
+        }
+        if (normA === 0 || normB === 0) return 0;
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
+    /**
+     * Runs `task` over every item in `items` with at most `concurrency` in
+     * flight at once, preserving input order in the returned results. Used to
+     * bound fan-out (e.g. org-wide search across every indexed collection)
+     * so it doesn't open thousands of concurrent Milvus round trips at once.
+     */
+    private async mapWithConcurrency<T, R>(items: T[], concurrency: number, task: (item: T) => Promise<R>): Promise<R[]> {
+        const results: R[] = new Array(items.length);
+        let nextIndex = 0;
+
+        async function worker(): Promise<void> {
+            while (true) {
+                const index = nextIndex++;
+                if (index >= items.length) return;
+                results[index] = await task(items[index]);
+            }
+        }
+
+        const workerCount = Math.max(1, Math.min(concurrency, items.length));
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        return results;
+    }
+
+    private async searchInCollection(collectionName: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, options?: { isHybrid?: boolean; precomputedEmbedding?: EmbeddingVector; skipProbeQuery?: boolean; includeVector?: boolean; skipDedup?: boolean }): Promise<SemanticSearchResult[]> {
+        const isHybrid = options?.isHybrid ?? this.getIsHybrid();
+        const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
+        console.log(`[Context] 🔍 Executing ${searchType}: "${query}"`);
         console.log(`[Context] 🔍 Using collection: ${collectionName}`);
 
         // Check if collection exists and has data
@@ -544,17 +871,20 @@ export class Context {
         }
 
         if (isHybrid === true) {
-            try {
-                // Check collection stats to see if it has data
-                const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
-                console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
-            } catch (error) {
-                console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
+            if (!options?.skipProbeQuery) {
+                try {
+                    // Check collection stats to see if it has data
+                    const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
+                    console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
+                } catch (error) {
+                    console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
+                }
             }
 
-            // 1. Generate query vector
+            // 1. Generate query vector (reuse the caller's, if given, to avoid
+            // re-embedding the same query once per collection during fan-out search)
             console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            const queryEmbedding: EmbeddingVector = options?.precomputedEmbedding ?? await this.embedding.embed(query);
             console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
             console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
 
@@ -588,7 +918,8 @@ export class Context {
                         params: { k: 100 }
                     },
                     limit: topK,
-                    filterExpr
+                    filterExpr,
+                    includeVector: options?.includeVector
                 }
             );
 
@@ -601,10 +932,14 @@ export class Context {
                 startLine: result.document.startLine,
                 endLine: result.document.endLine,
                 language: result.document.metadata.language || 'unknown',
-                score: result.score
+                score: result.score,
+                ...(options?.includeVector ? { vector: result.document.vector } : {})
             }));
 
-            const dedupedResults = this.deduplicateResults(results);
+            // Callers that re-score results afterwards (org-wide search) dedup
+            // themselves post-re-score: deduping here on RRF order could keep
+            // the weaker of two overlapping chunks.
+            const dedupedResults = options?.skipDedup ? results : this.deduplicateResults(results);
             console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
             if (dedupedResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${dedupedResults[0].score}, path: ${dedupedResults[0].relativePath}`);
@@ -614,7 +949,7 @@ export class Context {
         } else {
             // Regular semantic search
             // 1. Generate query vector
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            const queryEmbedding: EmbeddingVector = options?.precomputedEmbedding ?? await this.embedding.embed(query);
 
             // 2. Search in vector database
             const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
@@ -643,8 +978,8 @@ export class Context {
      * Deduplicate search results by file + line range overlap.
      * Keeps higher-scored result when two results from the same file overlap >50%.
      */
-    private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
-        const kept: SemanticSearchResult[] = [];
+    private deduplicateResults<T extends SemanticSearchResult>(results: T[]): T[] {
+        const kept: T[] = [];
 
         for (const result of results) {
             const overlaps = kept.some((existing) => {
@@ -673,6 +1008,55 @@ export class Context {
     async hasIndex(codebasePath: string): Promise<boolean> {
         const collectionName = this.getCollectionName(codebasePath);
         return await this.vectorDatabase.hasCollection(collectionName);
+    }
+
+    /**
+     * Check if index exists for a repo by its git remote identity string,
+     * with no local checkout required. See `getCollectionNameForRepo`.
+     */
+    async hasIndexForRepo(repoIdentifier: string): Promise<boolean> {
+        const collectionName = await this.resolveCollectionNameForRepo(repoIdentifier);
+        return collectionName !== undefined;
+    }
+
+    /**
+     * List every code_chunks/hybrid_code_chunks collection in the vector DB,
+     * with the repo identity and/or local codebase path recovered from each
+     * collection's description (set at index time). Lets a client discover
+     * what's searchable without already knowing a repo name or having any
+     * local checkout — pair with `semanticSearchByRepo`.
+     *
+     * Collections indexed before these fields existed only have `codebasePath`
+     * in their description (no `repo` identity, no `embeddingModel`) and are
+     * reported as such.
+     */
+    async listIndexedRepos(): Promise<Array<{ collectionName: string; repo?: string; embeddingModel?: string; codebasePath?: string }>> {
+        const allCollections = await this.vectorDatabase.listCollections();
+        const codeCollections = allCollections.filter(
+            (name) => name.startsWith('code_chunks_') || name.startsWith('hybrid_code_chunks_')
+        );
+
+        const results: Array<{ collectionName: string; repo?: string; embeddingModel?: string; codebasePath?: string }> = [];
+        for (const collectionName of codeCollections) {
+            let repo: string | undefined;
+            let embeddingModel: string | undefined;
+            let codebasePath: string | undefined;
+            try {
+                const description = await this.vectorDatabase.getCollectionDescription(collectionName);
+                // codebasePath is always the last field (see prepareCollection), so it's
+                // matched greedily to end-of-string — safe even if the path itself contains ';'.
+                const repoMatch = description.match(/(?:^|;)repo:([^;]*)/);
+                const modelMatch = description.match(/(?:^|;)embeddingModel:([^;]*)/);
+                const pathMatch = description.match(/(?:^|;)codebasePath:(.*)$/);
+                repo = repoMatch?.[1]?.trim() || undefined;
+                embeddingModel = modelMatch?.[1]?.trim() || undefined;
+                codebasePath = pathMatch?.[1]?.trim() || undefined;
+            } catch (error) {
+                console.warn(`[Context] ⚠️ Failed to read description for collection '${collectionName}': ${error}`);
+            }
+            results.push({ collectionName, repo, embeddingModel, codebasePath });
+        }
+        return results;
     }
 
     /**
@@ -779,6 +1163,7 @@ export class Context {
         const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
 
         if (collectionExists && !forceReindex) {
+            await this.ensureCollectionModelMatches(collectionName);
             console.log(`📋 Collection ${collectionName} already exists, skipping creation`);
             return;
         }
@@ -792,12 +1177,28 @@ export class Context {
         console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
         const dimension = await this.embedding.detectDimension();
         console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
-        const dirName = path.basename(codebasePath);
+
+        // Record the repo identity alongside the local path when available, so
+        // listIndexedRepos() can report a stable, human-recognizable name for
+        // this collection regardless of who indexed it or what folder they used.
+        // Also record the embedding provider/model, so org-wide search can
+        // refuse to cosine-compare vectors indexed with a different model that
+        // happens to share this one's dimension (same dimension ≠ same space).
+        // `repo` and `embeddingModel` (normalized, never contain ';' or
+        // newlines) go FIRST and `codebasePath` (an arbitrary, unescaped local
+        // path) goes LAST, since paths on Linux/Mac can legally contain ';' —
+        // parsing codebasePath greedily to end-of-string means an embedded ';'
+        // can never truncate it or get misread as the start of a later field.
+        const remoteIdentity = this.getGitRemoteIdentity(codebasePath);
+        const embeddingModel = this.getEmbeddingModelIdentity();
+        const description = remoteIdentity
+            ? `repo:${remoteIdentity};embeddingModel:${embeddingModel};codebasePath:${codebasePath}`
+            : `embeddingModel:${embeddingModel};codebasePath:${codebasePath}`;
 
         if (isHybrid === true) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+            await this.vectorDatabase.createHybridCollection(collectionName, dimension, description);
         } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+            await this.vectorDatabase.createCollection(collectionName, dimension, description);
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);

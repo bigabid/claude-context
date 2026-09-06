@@ -437,11 +437,13 @@ For LangChain/LangGraph integration examples, see [this example](https://github.
 <details>
 <summary><strong>Other MCP Clients</strong></summary>
 
-The server uses stdio transport and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
+The server uses stdio transport by default and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
 
 ```bash
 npx @zilliz/claude-context-mcp@latest
 ```
+
+To run one shared server instead (e.g. hosted in Kubernetes) rather than a local process per user, see [Hosting as a Shared Server (HTTP Transport)](packages/mcp/README.md#hosting-as-a-shared-server-http-transport) in the MCP package README.
 
 </details>
 
@@ -492,6 +494,8 @@ For detailed explanation of file inclusion and exclusion rules, and how to custo
 
 ### Available Tools
 
+> `index_codebase`, `search_code`, `clear_index`, and `get_indexing_status` operate on a local filesystem path, so they only apply to the default stdio transport (one process per user's checkout). When hosted over the [Streamable HTTP transport](packages/mcp/README.md#hosting-as-a-shared-server-http-transport) instead, those four are hidden and rejected — only `list_indexed_repos`, `search_repo`, and `search_org` are exposed, since the shared server has no local checkout of its own to search.
+
 #### 1. `index_codebase`
 
 Index a codebase directory for hybrid search (BM25 + dense vector).
@@ -507,6 +511,20 @@ Clear the search index for a specific codebase.
 #### 4. `get_indexing_status`
 
 Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.
+
+#### 5. `list_indexed_repos`
+
+List every repo/collection currently indexed in the shared vector database — no local checkout needed.
+
+#### 6. `search_repo`
+
+Search a specific, named indexed repo by its git remote identity (e.g. `github.com/org/repo`) instead of a local absolute path.
+
+#### 7. `search_org`
+
+Search across EVERY indexed repo at once, merged and ranked by score. This is the default choice for any question that isn't already anchored to a repo you can name — not just a fallback for when you're totally lost.
+
+See the [MCP package README](packages/mcp/README.md#available-tools) for full parameter details on all seven tools.
 
 ---
 
@@ -594,6 +612,13 @@ results.forEach(result => {
     console.log(`Content: ${result.content.substring(0, 100)}...`);
 });
 ```
+
+### Hosting a Shared Server + Auto-Sync Worker
+
+Two components for running Claude Context centrally for a team instead of one local process per user:
+
+- **[`@bigabid/claude-context-mcp` over HTTP](packages/mcp/README.md#hosting-as-a-shared-server-http-transport)** — the MCP server itself, run as a shared, stateless HTTP service (`Dockerfile`, [Helm chart](deploy/helm/claude-context-mcp)) instead of stdio. Handles search; has no access to anyone's local git checkouts, so it can't index new repos on its own.
+- **[`@bigabid/claude-context-sync-worker`](packages/sync-worker/README.md)** — a standalone Kubernetes CronJob that auto-discovers a GitHub org's repos via a GitHub App and keeps them indexed, so the shared server always has fresh content to search (`Dockerfile.sync-worker`, [Helm chart](deploy/helm/claude-context-sync-worker)). Meant to be the sole indexer for whichever repos it covers — see its README for why running it alongside laptop-side indexing of the same repos is unsafe.
 
 ### VSCode Extension
 

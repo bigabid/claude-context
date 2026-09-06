@@ -760,7 +760,10 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 search: [search_param_1, search_param_2],
                 rerank: rerank_strategy,
                 limit: options?.limit || searchRequests[0]?.limit || 10,
-                outputFields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+                outputFields: [
+                    'id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata',
+                    ...(options?.includeVector ? ['vector'] : []),
+                ],
             };
 
             console.log(`[MilvusRestfulDB] 🔍 Executing REST API hybrid search...`);
@@ -786,7 +789,7 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                     document: {
                         id: result.id,
                         content: result.content,
-                        vector: [], // Vector not returned in search results
+                        vector: options?.includeVector ? (result.vector ?? []) : [],
                         sparse_vector: [], // Vector not returned in search results
                         relativePath: result.relativePath,
                         startLine: result.startLine,

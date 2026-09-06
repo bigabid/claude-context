@@ -29,6 +29,13 @@ export interface HybridSearchOptions {
     rerank?: RerankStrategy;
     limit?: number;
     filterExpr?: string;
+    /**
+     * Also return each result's stored dense vector (`document.vector`).
+     * Needed when the caller re-scores results by similarity (e.g. org-wide
+     * search re-ranking across collections); off by default since vectors are
+     * large and single-collection callers only need the fused score.
+     */
+    includeVector?: boolean;
 }
 
 export interface RerankStrategy {

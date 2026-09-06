@@ -452,11 +452,13 @@ For LangChain/LangGraph integration examples, see [this example](https://github.
 <details>
 <summary><strong>Other MCP Clients</strong></summary>
 
-The server uses stdio transport and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
+The server uses stdio transport by default and follows the standard MCP protocol. It can be integrated with any MCP-compatible client by running:
 
 ```bash
 npx @zilliz/claude-context-mcp@latest
 ```
+
+To run one shared server instead (e.g. hosted in Kubernetes) rather than a local process per user, see [Hosting as a Shared Server (HTTP Transport)](../../packages/mcp/README.md#hosting-as-a-shared-server-http-transport) in the MCP package README.
 
 </details>
 

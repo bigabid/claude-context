@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+
+# Builds @bigabid/claude-context-sync-worker: a standalone batch job meant to
+# run as a Kubernetes CronJob (see deploy/helm/claude-context-sync-worker),
+# auto-discovering and indexing a GitHub org's repos. See packages/sync-worker/README.md.
+#
+# Multi-arch (linux/amd64 + linux/arm64): same split as the mcp Dockerfile —
+# the TypeScript compile is arch-independent and runs once on $BUILDPLATFORM;
+# only the deps stage (tree-sitter's native bindings) runs per TARGETPLATFORM.
+
+FROM --platform=$BUILDPLATFORM node:22-slim AS ts-builder
+
+RUN corepack enable && corepack prepare pnpm@10 --activate
+
+WORKDIR /repo
+COPY . .
+
+RUN pnpm install --frozen-lockfile
+
+RUN pnpm --filter @bigabid/claude-context-core build \
+    && pnpm --filter @bigabid/claude-context-sync-worker build
+
+FROM node:22-slim AS deps
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN corepack enable && corepack prepare pnpm@10 --activate
+
+WORKDIR /repo
+COPY . .
+
+RUN pnpm install --frozen-lockfile
+
+COPY --from=ts-builder /repo/packages/core/dist packages/core/dist
+COPY --from=ts-builder /repo/packages/sync-worker/dist packages/sync-worker/dist
+
+RUN pnpm --filter @bigabid/claude-context-sync-worker deploy --prod --legacy /out/sync-worker
+
+FROM node:22-slim AS runtime
+
+# The worker shells out to `git` directly for clone/fetch/reset.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin appuser
+
+WORKDIR /app
+COPY --from=deps /out/sync-worker .
+
+ENV CODE_CHUNKS_COLLECTION_KEY_SOURCE=git-remote \
+    SYNC_REPOS_DIR=/data/repos \
+    NODE_ENV=production
+
+USER appuser
+
+ENTRYPOINT ["node", "dist/index.js"]
